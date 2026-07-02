@@ -41,6 +41,54 @@ python -m beacon.main digest --include-investigate
 python -m beacon.main digest --since-hours 12 --limit 5
 ```
 
+Send a high-priority digest to Telegram:
+
+```powershell
+python -m beacon.main send-telegram-digest
+```
+
+Tune the Telegram digest:
+
+```powershell
+python -m beacon.main send-telegram-digest --minimum-score 90
+python -m beacon.main send-telegram-digest --include-investigate
+python -m beacon.main send-telegram-digest --since-hours 12 --limit 3
+```
+
+## Two-Hour Automation Cycle
+
+Run the full Beacon loop manually:
+
+```powershell
+python -m beacon.main run-cycle
+```
+
+By default this scans Gmail, applies the latest scoring and expiry rules to
+stored jobs, sends up to 5 Telegram jobs first seen in the last 2 hours with
+score 85 or higher, and polls Telegram for status replies.
+
+Tune the cycle:
+
+```powershell
+python -m beacon.main run-cycle --minimum-score 90
+python -m beacon.main run-cycle --telegram-limit 3
+python -m beacon.main run-cycle --include-investigate
+python -m beacon.main run-cycle --skip-telegram-poll
+```
+
+To schedule it every 2 hours with Windows Task Scheduler:
+
+```text
+Program/script:
+powershell.exe
+
+Arguments:
+-NoProfile -ExecutionPolicy Bypass -Command "cd D:\Kiana\Git\Beacon; $env:PYTHONPATH='src'; python -m beacon.main run-cycle"
+
+Trigger:
+Daily, repeat task every 2 hours
+```
+
 ## Inspect and Update Jobs
 
 Show full details for one job:
@@ -150,3 +198,35 @@ List Gmail mailbox names so labels can be configured correctly:
 ```powershell
 python -m beacon.main list-gmail-mailboxes
 ```
+
+## Telegram Settings
+
+Telegram alerts need these values in `.env`:
+
+```env
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+```
+
+Start with one-way alerts through `send-telegram-digest`. Full Telegram chat
+commands can come later after the notification path is reliable.
+
+## Telegram Status Commands
+
+After receiving a digest, send one of these messages to the bot:
+
+```text
+/applied 123
+/reviewed 123
+/skipped 123
+/followup 123
+```
+
+Then poll Telegram locally so Beacon can process those commands:
+
+```powershell
+python -m beacon.main poll-telegram
+```
+
+Beacon stores the latest Telegram update offset in `data/telegram_update_offset.txt`
+so the same bot message is not processed repeatedly.

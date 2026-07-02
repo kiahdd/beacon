@@ -5,6 +5,7 @@ import json
 import re
 import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from .compensation import format_salary_estimate
 from .dedupe import dedupe_jobs
@@ -25,6 +26,10 @@ from .storage import (
     update_job_status,
     upsert_scored_jobs,
 )
+from .telegram_notifier import fetch_telegram_updates, load_telegram_settings, send_telegram_message
+
+
+TELEGRAM_OFFSET_PATH = Path("data/telegram_update_offset.txt")
 
 
 def run_pipeline(email_source: EmailSource, source_label: str) -> int:
@@ -80,6 +85,54 @@ def run_gmail() -> int:
         email_source=GmailImapEmailSource(),
         source_label="Gmail IMAP",
     )
+
+
+def run_cycle(
+    since_hours: int = 2,
+    telegram_limit: int = 5,
+    include_investigate: bool = False,
+    minimum_score: int = 85,
+    poll_telegram_replies: bool = True,
+    poll_limit: int = 20,
+    poll_timeout: int = 0,
+) -> int:
+    """Run the repeatable automation loop for scheduled Beacon scans.
+
+    This is the command to put on a two-hour timer. It runs the Gmail ingestion
+    pipeline, refreshes stored rows with the latest scoring/expiry rules, sends
+    a concise Telegram digest for newly seen opportunities, and optionally
+    checks Telegram for status replies such as `/applied 123`.
+    """
+
+    print("Beacon run cycle")
+    print("Step 1/4: scan Gmail")
+    result = run_gmail()
+    if result != 0:
+        return result
+
+    print()
+    print("Step 2/4: refresh stored scores")
+    result = rescore_stored_jobs(apply=True)
+    if result != 0:
+        return result
+
+    print()
+    print("Step 3/4: send Telegram digest")
+    result = send_telegram_digest(
+        since_hours=since_hours,
+        limit=telegram_limit,
+        include_investigate=include_investigate,
+        minimum_score=minimum_score,
+    )
+    if result != 0:
+        return result
+
+    if not poll_telegram_replies:
+        return 0
+
+    print()
+    print("Step 4/4: poll Telegram replies")
+    return poll_telegram(limit=poll_limit, timeout=poll_timeout)
 
 
 def list_gmail_mailboxes() -> int:
@@ -155,6 +208,33 @@ def digest_jobs(
     return 0
 
 
+def send_telegram_digest(
+    since_hours: int = 24,
+    limit: int = 5,
+    include_investigate: bool = False,
+    minimum_score: int = 85,
+    now: datetime | None = None,
+) -> int:
+    """Send a concise Telegram digest of high-priority stored jobs."""
+
+    rows = _recent_digest_rows(
+        since_hours=since_hours,
+        limit=limit,
+        include_investigate=include_investigate,
+        minimum_score=minimum_score,
+        now=now,
+    )
+    message = _render_telegram_digest(
+        rows,
+        since_hours=since_hours,
+        include_investigate=include_investigate,
+        minimum_score=minimum_score,
+    )
+    send_telegram_message(message)
+    print(f"Sent Telegram digest with {len(rows)} job(s).")
+    return 0
+
+
 def show_job(job_id: int) -> int:
     """Print detailed information for one stored job."""
 
@@ -206,6 +286,49 @@ def set_job_status(job_id: int, status: str) -> int:
         return 1
 
     print(f"Updated job {job_id} status to {status}.")
+    return 0
+
+
+def poll_telegram(limit: int = 20, timeout: int = 0) -> int:
+    """Poll Telegram for status commands and update stored jobs."""
+
+    settings = load_telegram_settings()
+    updates = fetch_telegram_updates(
+        settings=settings,
+        offset=_read_telegram_offset(),
+        limit=limit,
+        timeout=timeout,
+    )
+    if not updates:
+        print("No Telegram updates found.")
+        return 0
+
+    processed_count = 0
+    max_update_id: int | None = None
+    for update in updates:
+        update_id = _telegram_update_id(update)
+        if update_id is not None:
+            max_update_id = update_id if max_update_id is None else max(max_update_id, update_id)
+
+        message = update.get("message")
+        if not isinstance(message, dict):
+            continue
+        chat = message.get("chat")
+        if not isinstance(chat, dict) or str(chat.get("id")) != settings.chat_id:
+            continue
+        text = message.get("text")
+        if not isinstance(text, str):
+            continue
+
+        response = _handle_telegram_command(text)
+        if response:
+            send_telegram_message(response, settings=settings)
+            processed_count += 1
+
+    if max_update_id is not None:
+        _write_telegram_offset(max_update_id + 1)
+
+    print(f"Processed {processed_count} Telegram command(s).")
     return 0
 
 
@@ -386,6 +509,50 @@ def build_parser() -> argparse.ArgumentParser:
         "run-gmail",
         help="Run the Beacon pipeline against Gmail IMAP using .env.",
     )
+    cycle_parser = subparsers.add_parser(
+        "run-cycle",
+        help="Run Gmail, rescore stored jobs, send Telegram digest, and poll replies.",
+    )
+    cycle_parser.add_argument(
+        "--since-hours",
+        type=int,
+        default=2,
+        help="Only send jobs first seen within this many hours.",
+    )
+    cycle_parser.add_argument(
+        "--telegram-limit",
+        type=int,
+        default=5,
+        help="Maximum number of jobs to send to Telegram.",
+    )
+    cycle_parser.add_argument(
+        "--include-investigate",
+        action="store_true",
+        help="Include Investigate jobs in addition to Apply now jobs.",
+    )
+    cycle_parser.add_argument(
+        "--minimum-score",
+        type=int,
+        default=85,
+        help="Only send jobs with at least this score.",
+    )
+    cycle_parser.add_argument(
+        "--skip-telegram-poll",
+        action="store_true",
+        help="Do not poll Telegram for status replies after sending the digest.",
+    )
+    cycle_parser.add_argument(
+        "--poll-limit",
+        type=int,
+        default=20,
+        help="Maximum number of Telegram updates to fetch.",
+    )
+    cycle_parser.add_argument(
+        "--poll-timeout",
+        type=int,
+        default=0,
+        help="Telegram long-poll timeout in seconds.",
+    )
     subparsers.add_parser(
         "list-gmail-mailboxes",
         help="List Gmail IMAP mailbox names for label configuration.",
@@ -414,6 +581,49 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-investigate",
         action="store_true",
         help="Include Investigate jobs in addition to Apply now jobs.",
+    )
+    telegram_parser = subparsers.add_parser(
+        "send-telegram-digest",
+        help="Send recent high-priority jobs to Telegram.",
+    )
+    telegram_parser.add_argument(
+        "--since-hours",
+        type=int,
+        default=24,
+        help="Only include jobs added within this many hours.",
+    )
+    telegram_parser.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="Maximum number of jobs to send.",
+    )
+    telegram_parser.add_argument(
+        "--include-investigate",
+        action="store_true",
+        help="Include Investigate jobs in addition to Apply now jobs.",
+    )
+    telegram_parser.add_argument(
+        "--minimum-score",
+        type=int,
+        default=85,
+        help="Only send jobs with at least this score.",
+    )
+    poll_telegram_parser = subparsers.add_parser(
+        "poll-telegram",
+        help="Poll Telegram for job status commands.",
+    )
+    poll_telegram_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of Telegram updates to fetch.",
+    )
+    poll_telegram_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=0,
+        help="Telegram long-poll timeout in seconds.",
     )
     show_parser = subparsers.add_parser(
         "show-job",
@@ -485,6 +695,16 @@ def main() -> int:
             return run_local()
         if args.command == "run-gmail":
             return run_gmail()
+        if args.command == "run-cycle":
+            return run_cycle(
+                since_hours=args.since_hours,
+                telegram_limit=args.telegram_limit,
+                include_investigate=args.include_investigate,
+                minimum_score=args.minimum_score,
+                poll_telegram_replies=not args.skip_telegram_poll,
+                poll_limit=args.poll_limit,
+                poll_timeout=args.poll_timeout,
+            )
         if args.command == "list-gmail-mailboxes":
             return list_gmail_mailboxes()
         if args.command == "list-jobs":
@@ -495,6 +715,15 @@ def main() -> int:
                 limit=args.limit,
                 include_investigate=args.include_investigate,
             )
+        if args.command == "send-telegram-digest":
+            return send_telegram_digest(
+                since_hours=args.since_hours,
+                limit=args.limit,
+                include_investigate=args.include_investigate,
+                minimum_score=args.minimum_score,
+            )
+        if args.command == "poll-telegram":
+            return poll_telegram(limit=args.limit, timeout=args.timeout)
         if args.command == "show-job":
             return show_job(args.job_id)
         if args.command == "update-status":
@@ -626,6 +855,32 @@ def _parse_stored_timestamp(value: str | None, fallback: datetime) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def _recent_digest_rows(
+    since_hours: int,
+    limit: int,
+    include_investigate: bool,
+    minimum_score: int = 0,
+    now: datetime | None = None,
+) -> list[object]:
+    """Return stored rows eligible for digest-style output."""
+
+    connection = initialize_storage()
+    rows = fetch_all_jobs(connection)
+    connection.close()
+
+    current_time = now or datetime.now(UTC)
+    cutoff = current_time - timedelta(hours=since_hours)
+    visible_categories = ("Apply now", "Investigate") if include_investigate else ("Apply now",)
+    return [
+        row
+        for row in rows
+        if row["category"] in visible_categories
+        and not row["is_expired"]
+        and row["score"] >= minimum_score
+        and _parse_stored_timestamp(row["first_seen_at"], fallback=current_time) >= cutoff
+    ][:limit]
+
+
 def _render_stored_digest(rows: list[object], since_hours: int, include_investigate: bool) -> str:
     """Render database rows into the concise digest used by the CLI."""
 
@@ -641,6 +896,96 @@ def _render_stored_digest(rows: list[object], since_hours: int, include_investig
         lines.append(f"   Link: {link}")
         lines.append(f"   Why: {_console_text(row['explanation'])}")
     return "\n".join(_console_text(line) for line in lines)
+
+
+def _render_telegram_digest(
+    rows: list[object],
+    since_hours: int,
+    include_investigate: bool,
+    minimum_score: int,
+) -> str:
+    """Render a compact plain-text Telegram job digest."""
+
+    categories = "Apply now and Investigate" if include_investigate else "Apply now"
+    if not rows:
+        return (
+            f"Beacon: no {categories} jobs found in the last {since_hours} "
+            f"hour(s) with score >= {minimum_score}."
+        )
+
+    lines = [
+        f"Beacon digest: {len(rows)} {categories} job(s)",
+        f"Window: last {since_hours} hour(s), score >= {minimum_score}",
+        "",
+    ]
+    for rank, row in enumerate(rows, 1):
+        link = row["job_link"] or "No job URL found"
+        lines.append(
+            f"{rank}. [{row['score']}] #{row['id']} "
+            f"{row['company']} - {row['title']}"
+        )
+        lines.append(
+            "   "
+            f"Posted: {_format_posted_age(row['posted_date'])} | "
+            f"Salary: {_format_table_salary(row['salary_estimate'])} | "
+            f"Type: {_format_table_employment_type(row)}"
+        )
+        lines.append(f"   Link: {link}")
+        lines.append(f"   Why: {_truncate(_console_text(row['explanation']), 260)}")
+        lines.append("")
+    return "\n".join(_console_text(line) for line in lines).strip()
+
+
+def _handle_telegram_command(text: str) -> str | None:
+    """Apply supported Telegram commands and return a confirmation message."""
+
+    command = _parse_telegram_status_command(text)
+    if command is None:
+        if text.strip().startswith("/"):
+            return (
+                "Unknown command. Use /applied <job_id>, /reviewed <job_id>, "
+                "/skipped <job_id>, or /followup <job_id>."
+            )
+        return None
+
+    job_id, status = command
+    connection = initialize_storage()
+    try:
+        updated = update_job_status(connection, job_id, status)
+    except ValueError as error:
+        connection.close()
+        return str(error)
+
+    row = fetch_job_by_id(connection, job_id) if updated else None
+    connection.close()
+    if not updated or row is None:
+        return f"No job found with id {job_id}."
+    return f"Updated #{job_id} to {row['status']}: {row['company']} - {row['title']}"
+
+
+def _parse_telegram_status_command(text: str) -> tuple[int, str] | None:
+    """Parse Telegram status commands such as `/applied 123`."""
+
+    match = re.match(r"^/(?P<command>\w+)(?:@\w+)?\s+(?P<job_id>\d+)\s*$", text.strip())
+    if not match:
+        return None
+
+    aliases = {
+        "new": "new",
+        "reviewed": "reviewed",
+        "review": "reviewed",
+        "applied": "applied",
+        "apply": "applied",
+        "skipped": "skipped",
+        "skip": "skipped",
+        "followup": "follow-up needed",
+        "follow-up": "follow-up needed",
+        "follow": "follow-up needed",
+    }
+    command = aliases.get(match.group("command").casefold())
+    if command is None:
+        return None
+    return int(match.group("job_id")), command
 
 
 def _employment_type_from_row(row: object) -> str:
@@ -720,6 +1065,35 @@ def _yes_no_short(value: object) -> str:
     """Format booleans for dense table output."""
 
     return "Y" if bool(value) else "N"
+
+
+def _read_telegram_offset(path: Path | None = None) -> int | None:
+    """Read the next Telegram update offset from disk."""
+
+    active_path = path or TELEGRAM_OFFSET_PATH
+    if not active_path.exists():
+        return None
+    try:
+        return int(active_path.read_text(encoding="utf-8").strip())
+    except ValueError:
+        return None
+
+
+def _write_telegram_offset(offset: int, path: Path | None = None) -> None:
+    """Persist the next Telegram update offset."""
+
+    active_path = path or TELEGRAM_OFFSET_PATH
+    active_path.parent.mkdir(parents=True, exist_ok=True)
+    active_path.write_text(str(offset), encoding="utf-8")
+
+
+def _telegram_update_id(update: object) -> int | None:
+    """Return Telegram update id when present."""
+
+    if not isinstance(update, dict):
+        return None
+    value = update.get("update_id")
+    return value if isinstance(value, int) else None
 
 
 def _console_text(value: object) -> str:

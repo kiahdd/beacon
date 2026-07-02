@@ -356,8 +356,9 @@ available, no longer accepting applications, closed, or when a parsed expiry
 date is in the past. Beacon should also mark roles as expired when the parsed
 posted age is 14 days or older.
 
-Future notification options:
+Notification options:
 
+- Telegram digest alerts
 - SMS
 - WhatsApp
 - Push notifications
