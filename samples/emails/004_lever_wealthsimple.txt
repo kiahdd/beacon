@@ -1,0 +1,36 @@
+From: Lever <jobs@lever.co>
+Subject: Senior Data Scientist - Wealthsimple
+
+Location
+
+Toronto Hybrid
+
+Responsibilities
+
+- Personalization
+- Recommendations
+- Experimentation
+- Bayesian methods
+- Product analytics
+- ML deployment
+
+Required
+
+Python
+
+SQL
+
+Spark
+
+Airflow
+
+MLflow
+
+Salary
+
+CA$160k-195k
+
+Apply
+
+https://jobs.lever.co/wealthsimple/abc123
+

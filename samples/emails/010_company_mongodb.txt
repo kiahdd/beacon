@@ -1,0 +1,25 @@
+From: careers@mongodb.com
+Subject: Senior AI Platform Engineer
+
+Location
+
+Remote Canada
+
+Responsibilities
+
+- Build internal AI platform
+- MLOps
+- Kubernetes
+- Databricks
+- Vector databases
+- AI agents
+- Evaluation pipelines
+
+Salary
+
+CA$170k-230k
+
+Apply
+
+https://www.mongodb.com/careers/jobs/12345
+

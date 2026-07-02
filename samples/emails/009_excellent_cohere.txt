@@ -1,0 +1,35 @@
+From: LinkedIn Jobs <jobs-noreply@linkedin.com>
+Subject: Senior Applied AI Engineer - Cohere
+
+Location
+
+Remote Canada
+
+Salary
+
+CA$180k-250k
+
+Responsibilities
+
+- Enterprise AI
+- Agentic workflows
+- LLM evaluation
+- Tool calling
+- RAG
+- Distributed inference
+- Production deployment
+
+Preferred
+
+- Databricks
+- MLflow
+- Kubernetes
+- Prompt optimization
+- AI safety
+
+Posted 12 minutes ago.
+
+Apply
+
+https://cohere.ai/careers/123456
+

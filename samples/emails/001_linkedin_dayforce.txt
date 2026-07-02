@@ -1,0 +1,38 @@
+From: LinkedIn Jobs <jobs-noreply@linkedin.com>
+Subject: New job matching your preferences: Senior Machine Learning Engineer at Dayforce
+
+Hi Kiana,
+
+A new opportunity matching your job alerts has been posted.
+
+Senior Machine Learning Engineer
+
+Company: Dayforce
+Location: Remote - Canada
+Salary: CA$145,000-210,000
+
+Requirements
+
+- 5+ years building production ML systems
+- Python
+- Spark
+- Databricks
+- MLflow
+- Kubernetes
+- Feature Engineering
+- Experimentation
+- Recommendation Systems
+- LLM experience is a plus
+
+Nice to Have
+
+- Agentic AI
+- Retrieval-Augmented Generation
+- Model Monitoring
+- MLOps
+
+Apply:
+https://jobs.dayforce.com/12345
+
+Posted 37 minutes ago.
+

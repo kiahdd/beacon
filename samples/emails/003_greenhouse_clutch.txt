@@ -1,0 +1,39 @@
+From: Greenhouse <no-reply@greenhouse.io>
+Subject: Staff Data Scientist - Clutch
+
+Company
+
+Clutch
+
+Location
+
+Toronto
+
+Salary
+
+CA$180k-240k
+
+Description
+
+We're looking for a Staff Data Scientist to define technical strategy across multiple ML initiatives.
+
+Responsibilities
+
+- Technical leadership
+- ML Platform
+- Forecasting
+- Experimentation
+- Production ML
+- Recommendation Systems
+- Mentoring
+
+Requirements
+
+8+ years experience
+
+Apply
+
+https://boards.greenhouse.io/clutch/jobs/111111
+
+Posted today.
+

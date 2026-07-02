@@ -1,0 +1,21 @@
+From: Alex Wong <alex@cohere.ai>
+Subject: Applied AI opportunity
+
+Hi Kiana,
+
+Your background in ML systems and Databricks caught our attention.
+
+We're expanding our Applied AI team.
+
+Areas include:
+
+- AI Agents
+- Retrieval-Augmented Generation
+- Evaluation Frameworks
+- Tool Calling
+- Enterprise AI
+
+Would you be open to a conversation?
+
+Alex
+

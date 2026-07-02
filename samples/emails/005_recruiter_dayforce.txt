@@ -1,0 +1,27 @@
+From: Sarah Kim <sarah.kim@dayforce.com>
+Subject: Interested in chatting?
+
+Hi Kiana,
+
+I came across your profile and was impressed by your experience building production ML systems, Databricks pipelines, and experimentation frameworks.
+
+We're hiring a Senior Machine Learning Engineer on our AI Platform team.
+
+The role focuses on:
+
+- ML infrastructure
+- AI platform development
+- Feature stores
+- LLM integration
+- Model deployment
+
+If you're interested, I'd love to schedule a short introductory call.
+
+Best,
+
+Sarah Kim
+
+Senior Technical Recruiter
+
+Dayforce
+

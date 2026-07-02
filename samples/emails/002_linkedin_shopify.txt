@@ -1,0 +1,35 @@
+From: LinkedIn Jobs <jobs-noreply@linkedin.com>
+Subject: Applied AI Engineer - Shopify
+
+Hi Kiana,
+
+A new opportunity has been posted.
+
+Company: Shopify
+Role: Applied AI Engineer
+Location: Toronto / Remote Canada
+
+Responsibilities
+
+- Build LLM applications
+- AI agents
+- Evaluation pipelines
+- Prompt engineering
+- Tool use
+- Production deployment
+- Python
+- Distributed systems
+
+Preferred
+
+- Databricks
+- LangGraph
+- MCP
+- RAG
+- OpenAI
+
+Apply:
+https://careers.shopify.com/jobs/99999
+
+Posted 18 minutes ago.
+
