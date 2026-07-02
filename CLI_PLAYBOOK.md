@@ -24,9 +24,20 @@ List stored jobs in the compact review table:
 python -m beacon.main list-jobs
 ```
 
-The table is designed for scanning. Unknown salary/type values are shown as `-`,
-posted ages are shortened like `37m`, `11d`, or `2mo`, and `Exp` shows whether
-Beacon considers the job expired.
+The default table is designed for scanning. `Desc` shows whether Beacon has
+fetched a full job description: `Y` means fetched, `N` means not fetched, and
+`Err` means a fetch was attempted but failed.
+
+Use debug mode when you need the wider diagnostic table:
+
+```powershell
+python -m beacon.main list-jobs --debug
+```
+
+Debug mode includes salary estimate, employment type, seen count, expiry,
+posted age, and other parsing/enrichment signals. Unknown salary/type values are
+shown as `-`, posted ages are shortened like `37m`, `11d`, or `2mo`, and `Exp`
+shows whether Beacon considers the job expired.
 
 Show the highest-priority recent jobs:
 
@@ -50,9 +61,10 @@ python -m beacon.main send-telegram-digest
 Tune the Telegram digest:
 
 ```powershell
-python -m beacon.main send-telegram-digest --minimum-score 90
 python -m beacon.main send-telegram-digest --include-investigate
 python -m beacon.main send-telegram-digest --since-hours 12 --limit 3
+python -m beacon.main send-telegram-digest --max-seen-count 2
+python -m beacon.main send-telegram-digest --minimum-score 90
 ```
 
 ## Two-Hour Automation Cycle
@@ -64,15 +76,20 @@ python -m beacon.main run-cycle
 ```
 
 By default this scans Gmail, applies the latest scoring and expiry rules to
-stored jobs, sends up to 5 Telegram jobs first seen in the last 2 hours with
-score 85 or higher, and polls Telegram for status replies.
+stored jobs, fetches full job descriptions for up to 5 promising jobs, sends up
+to 5 `Apply now` Telegram jobs first seen in the last 48 hours, excludes jobs
+Beacon has already seen 3 or more times, only includes jobs still marked `New`,
+and polls Telegram for status replies.
 
 Tune the cycle:
 
 ```powershell
-python -m beacon.main run-cycle --minimum-score 90
 python -m beacon.main run-cycle --telegram-limit 3
 python -m beacon.main run-cycle --include-investigate
+python -m beacon.main run-cycle --max-seen-count 2
+python -m beacon.main run-cycle --minimum-score 90
+python -m beacon.main run-cycle --description-limit 10
+python -m beacon.main run-cycle --skip-description-fetch
 python -m beacon.main run-cycle --skip-telegram-poll
 ```
 
@@ -96,6 +113,9 @@ Show full details for one job:
 ```powershell
 python -m beacon.main show-job <job_id>
 ```
+
+If a full description has been fetched, `show-job` prints it after the core job
+metadata and scoring explanation.
 
 Update workflow status after reviewing or applying:
 
@@ -125,6 +145,31 @@ python -m beacon.main rescore-stored-jobs --apply
 Use this after changing scoring rules, expiration rules, company preferences, or
 salary/employment-type logic. This is the command that updates old rows such as
 `129d` postings into expired `Skip` rows.
+
+## Fetch Full Job Descriptions
+
+Before calling Claude, enrich promising stored jobs with the full public posting
+text when Beacon has a job URL:
+
+```powershell
+python -m beacon.main fetch-job-descriptions
+```
+
+By default this fetches up to 5 jobs that are `Apply now`, `New`, not expired,
+and have not already had a description stored.
+
+Tune the fetch:
+
+```powershell
+python -m beacon.main fetch-job-descriptions --limit 10
+python -m beacon.main fetch-job-descriptions --include-investigate
+python -m beacon.main fetch-job-descriptions --force
+python -m beacon.main fetch-job-descriptions --timeout 30
+```
+
+Some sites, especially LinkedIn, may show login/preview pages instead of the
+full job description. Beacon stores either the extracted text or the fetch error
+so the later Claude step can decide whether it has enough context.
 
 ## Repair Stored Data
 

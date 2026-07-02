@@ -123,6 +123,47 @@ def update_job_status(connection: sqlite3.Connection, job_id: int, status: str) 
     return cursor.rowcount > 0
 
 
+def update_job_description(
+    connection: sqlite3.Connection,
+    job_id: int,
+    description: str | None,
+    final_url: str | None,
+    error: str | None = None,
+    description_status: str | None = None,
+    description_source: str | None = None,
+    fetched_at: datetime | None = None,
+) -> bool:
+    """Store fetched job-description text or the fetch error for one row."""
+
+    timestamp = (fetched_at or datetime.now(UTC)).isoformat()
+    cursor = connection.execute(
+        """
+        UPDATE jobs
+        SET
+            job_description = ?,
+            job_description_url = ?,
+            job_description_error = ?,
+            description_status = ?,
+            description_source = ?,
+            job_description_fetched_at = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            description,
+            final_url,
+            error,
+            description_status,
+            description_source,
+            timestamp,
+            timestamp,
+            job_id,
+        ),
+    )
+    connection.commit()
+    return cursor.rowcount > 0
+
+
 def update_scored_job_by_id(
     connection: sqlite3.Connection,
     job_id: int,
@@ -149,6 +190,7 @@ def update_scored_job_by_id(
             required_skills_json = ?,
             preferred_skills_json = ?,
             job_link = ?,
+            source_url = ?,
             source_email = ?,
             posted_date = ?,
             is_expired = ?,
@@ -169,6 +211,7 @@ def update_scored_job_by_id(
             job.seniority,
             json.dumps(job.required_skills),
             json.dumps(job.preferred_skills),
+            job.job_link,
             job.job_link,
             job.source_email,
             job.posted_date,
@@ -230,8 +273,16 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             required_skills_json TEXT NOT NULL,
             preferred_skills_json TEXT NOT NULL,
             job_link TEXT,
+            source_url TEXT,
+            canonical_url TEXT,
             source_email TEXT,
             posted_date TEXT,
+            job_description TEXT,
+            job_description_url TEXT,
+            job_description_fetched_at TEXT,
+            job_description_error TEXT,
+            description_status TEXT,
+            description_source TEXT,
             is_expired INTEGER NOT NULL DEFAULT 0,
             score INTEGER NOT NULL,
             category TEXT NOT NULL,
@@ -294,6 +345,37 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
                 (estimate_salary(row["salary_range"]), row["id"]),
             )
 
+    if "job_description" not in existing_columns:
+        connection.execute("ALTER TABLE jobs ADD COLUMN job_description TEXT")
+
+    if "source_url" not in existing_columns:
+        connection.execute("ALTER TABLE jobs ADD COLUMN source_url TEXT")
+        connection.execute(
+            """
+            UPDATE jobs
+            SET source_url = job_link
+            WHERE source_url IS NULL
+            """
+        )
+
+    if "canonical_url" not in existing_columns:
+        connection.execute("ALTER TABLE jobs ADD COLUMN canonical_url TEXT")
+
+    if "job_description_url" not in existing_columns:
+        connection.execute("ALTER TABLE jobs ADD COLUMN job_description_url TEXT")
+
+    if "job_description_fetched_at" not in existing_columns:
+        connection.execute("ALTER TABLE jobs ADD COLUMN job_description_fetched_at TEXT")
+
+    if "job_description_error" not in existing_columns:
+        connection.execute("ALTER TABLE jobs ADD COLUMN job_description_error TEXT")
+
+    if "description_status" not in existing_columns:
+        connection.execute("ALTER TABLE jobs ADD COLUMN description_status TEXT")
+
+    if "description_source" not in existing_columns:
+        connection.execute("ALTER TABLE jobs ADD COLUMN description_source TEXT")
+
     connection.commit()
 
 
@@ -324,6 +406,7 @@ def _upsert_scored_job(
             required_skills_json,
             preferred_skills_json,
             job_link,
+            source_url,
             source_email,
             posted_date,
             is_expired,
@@ -334,7 +417,7 @@ def _upsert_scored_job(
             created_at,
             updated_at
         )
-        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', ?, ?)
+        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', ?, ?)
         ON CONFLICT(job_fingerprint) DO UPDATE SET
             last_seen_at = excluded.last_seen_at,
             seen_count = jobs.seen_count + 1,
@@ -348,6 +431,7 @@ def _upsert_scored_job(
             required_skills_json = excluded.required_skills_json,
             preferred_skills_json = excluded.preferred_skills_json,
             job_link = excluded.job_link,
+            source_url = excluded.source_url,
             source_email = excluded.source_email,
             posted_date = excluded.posted_date,
             is_expired = excluded.is_expired,
@@ -369,6 +453,7 @@ def _upsert_scored_job(
             job.seniority,
             json.dumps(job.required_skills),
             json.dumps(job.preferred_skills),
+            job.job_link,
             job.job_link,
             job.source_email,
             job.posted_date,

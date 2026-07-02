@@ -1,2 +1,6 @@
-# Local POC currently uses only the Python standard library.
-
+trafilatura
+lxml_html_clean
+readability-lxml
+selectolax
+python-telegram-bot==13.15
+tornado==6.1

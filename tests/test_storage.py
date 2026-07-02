@@ -11,6 +11,7 @@ from beacon.storage import (
     fetch_job_by_id,
     initialize_storage,
     job_fingerprint,
+    update_job_description,
     update_job_status,
     upsert_scored_jobs,
 )
@@ -41,6 +42,8 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(rows[0]["seen_count"], 1)
         self.assertEqual(rows[0]["is_expired"], 0)
         self.assertEqual(rows[0]["salary_estimate"], 215_000)
+        self.assertEqual(rows[0]["source_url"], "https://cohere.ai/careers/123456")
+        self.assertIsNone(rows[0]["canonical_url"])
         self.assertEqual(rows[0]["score"], 95)
         self.assertEqual(rows[0]["created_at"], "2026-06-29T12:00:00+00:00")
         self.assertEqual(rows[0]["updated_at"], "2026-06-29T12:00:00+00:00")
@@ -148,6 +151,39 @@ class StorageTests(unittest.TestCase):
         self.assertIn("salary_estimate", columns)
         self.assertEqual(row["salary_estimate"], 215_000)
 
+    def test_initialization_migrates_job_description_columns(self) -> None:
+        """Older local DBs should gain enrichment fields for fetched postings."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "beacon.db"
+            connection = initialize_storage(db_path)
+            upsert_scored_jobs([_scored_job(company="Cohere", title="Senior Applied AI Engineer")], connection)
+            connection.execute("ALTER TABLE jobs DROP COLUMN job_description")
+            connection.execute("ALTER TABLE jobs DROP COLUMN source_url")
+            connection.execute("ALTER TABLE jobs DROP COLUMN canonical_url")
+            connection.execute("ALTER TABLE jobs DROP COLUMN job_description_url")
+            connection.execute("ALTER TABLE jobs DROP COLUMN job_description_fetched_at")
+            connection.execute("ALTER TABLE jobs DROP COLUMN job_description_error")
+            connection.execute("ALTER TABLE jobs DROP COLUMN description_status")
+            connection.execute("ALTER TABLE jobs DROP COLUMN description_source")
+            connection.commit()
+            connection.close()
+
+            migrated_connection = initialize_storage(db_path)
+            columns = {
+                row["name"]
+                for row in migrated_connection.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            migrated_connection.close()
+
+        self.assertIn("job_description", columns)
+        self.assertIn("source_url", columns)
+        self.assertIn("canonical_url", columns)
+        self.assertIn("job_description_url", columns)
+        self.assertIn("job_description_fetched_at", columns)
+        self.assertIn("job_description_error", columns)
+        self.assertIn("description_status", columns)
+        self.assertIn("description_source", columns)
+
     def test_fingerprint_uses_dedupe_identity_fields(self) -> None:
         """Case and whitespace differences should not change the fingerprint."""
         first = _scored_job(company="Cohere", title="Senior Applied AI Engineer")
@@ -220,6 +256,34 @@ class StorageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 update_job_status(connection, job_id, "maybe later")
             connection.close()
+
+    def test_update_job_description_stores_fetched_text(self) -> None:
+        """Fetched page text should be stored separately from parsed email data."""
+        fetched_at = datetime(2026, 7, 2, 16, 0, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            connection = initialize_storage(Path(temp_dir) / "beacon.db")
+            upsert_scored_jobs([_scored_job(company="Cohere", title="Senior Applied AI Engineer")], connection)
+            job_id = fetch_all_jobs(connection)[0]["id"]
+
+            updated = update_job_description(
+                connection=connection,
+                job_id=job_id,
+                description="Build LLM evaluation systems.",
+                final_url="https://cohere.ai/careers/123456",
+                description_status="fetched",
+                description_source="direct_url",
+                fetched_at=fetched_at,
+            )
+            row = fetch_job_by_id(connection, job_id)
+            connection.close()
+
+        self.assertTrue(updated)
+        self.assertEqual(row["job_description"], "Build LLM evaluation systems.")
+        self.assertEqual(row["job_description_url"], "https://cohere.ai/careers/123456")
+        self.assertEqual(row["job_description_fetched_at"], fetched_at.isoformat())
+        self.assertIsNone(row["job_description_error"])
+        self.assertEqual(row["description_status"], "fetched")
+        self.assertEqual(row["description_source"], "direct_url")
 
 
 def _scored_job(

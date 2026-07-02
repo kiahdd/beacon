@@ -8,11 +8,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .compensation import format_salary_estimate
+from .canonical_job_resolver import resolve_source_job_url
 from .dedupe import dedupe_jobs
 from .digest import render_digest
 from .email_filter import is_likely_job_email, is_obvious_non_job_row
 from .email_sources import EmailSource, GmailImapEmailSource, LocalFixtureEmailSource
 from .employment import infer_employment_type
+from .job_description_fetcher import fetch_job_description
 from .models import JobOpportunity
 from .normalization import normalize_company, normalize_title
 from .parser import parse_email
@@ -23,6 +25,7 @@ from .storage import (
     fetch_job_by_id,
     initialize_storage,
     update_scored_job_by_id,
+    update_job_description,
     update_job_status,
     upsert_scored_jobs,
 )
@@ -88,10 +91,14 @@ def run_gmail() -> int:
 
 
 def run_cycle(
-    since_hours: int = 2,
+    since_hours: int = 48,
     telegram_limit: int = 5,
     include_investigate: bool = False,
-    minimum_score: int = 85,
+    minimum_score: int | None = None,
+    max_seen_count: int = 3,
+    fetch_descriptions: bool = True,
+    description_limit: int = 5,
+    description_timeout: int = 20,
     poll_telegram_replies: bool = True,
     poll_limit: int = 20,
     poll_timeout: int = 0,
@@ -105,24 +112,40 @@ def run_cycle(
     """
 
     print("Beacon run cycle")
-    print("Step 1/4: scan Gmail")
+    print("Step 1/5: scan Gmail")
     result = run_gmail()
     if result != 0:
         return result
 
     print()
-    print("Step 2/4: refresh stored scores")
+    print("Step 2/5: refresh stored scores")
     result = rescore_stored_jobs(apply=True)
     if result != 0:
         return result
 
     print()
-    print("Step 3/4: send Telegram digest")
+    if fetch_descriptions:
+        print("Step 3/5: fetch full job descriptions")
+        result = fetch_job_descriptions(
+            limit=description_limit,
+            include_investigate=include_investigate,
+            force=False,
+            timeout=description_timeout,
+        )
+        if result != 0:
+            return result
+        print()
+    else:
+        print("Step 3/5: skip full job descriptions")
+        print()
+
+    print("Step 4/5: send Telegram digest")
     result = send_telegram_digest(
         since_hours=since_hours,
         limit=telegram_limit,
         include_investigate=include_investigate,
         minimum_score=minimum_score,
+        max_seen_count=max_seen_count,
     )
     if result != 0:
         return result
@@ -131,7 +154,7 @@ def run_cycle(
         return 0
 
     print()
-    print("Step 4/4: poll Telegram replies")
+    print("Step 5/5: poll Telegram replies")
     return poll_telegram(limit=poll_limit, timeout=poll_timeout)
 
 
@@ -150,8 +173,8 @@ def list_gmail_mailboxes() -> int:
     return 0
 
 
-def list_jobs() -> int:
-    """Print a compact table of stored jobs."""
+def list_jobs(debug: bool = False) -> int:
+    """Print stored jobs in either clean review mode or debug mode."""
 
     connection = initialize_storage()
     rows = fetch_all_jobs(connection)
@@ -161,8 +184,36 @@ def list_jobs() -> int:
         print("No stored jobs found. Run `python -m beacon.main run-local` first.")
         return 0
 
-    print("ID   Sc  Sal      Type      Cat    St      Seen  Exp  Posted  Added        Company        Title")
-    print("---  --  -------  --------  -----  ------  ----  ---  ------  -----------  -------------  -----")
+    if debug:
+        _print_jobs_debug_table(rows)
+    else:
+        _print_jobs_clean_table(rows)
+    return 0
+
+
+def _print_jobs_clean_table(rows: list[object]) -> None:
+    """Print the default table for human review."""
+
+    print("ID   Score  Action  Status  Desc  Added        Company        Title")
+    print("---  -----  ------  ------  ----  -----------  -------------  -----")
+    for row in rows:
+        print(
+            f"{row['id']:<3}  "
+            f"{row['score']:<5}  "
+            f"{_format_table_category(row['category']):<6}  "
+            f"{_format_table_status(row['status']):<6}  "
+            f"{_format_description_status(row):<4}  "
+            f"{_format_table_timestamp(row['first_seen_at']):<11}  "
+            f"{_truncate(_console_text(row['company']), 13):<13}  "
+            f"{_truncate(_console_text(row['title']), 92)}"
+        )
+
+
+def _print_jobs_debug_table(rows: list[object]) -> None:
+    """Print a wider table with parsing, enrichment, and freshness signals."""
+
+    print("ID   Sc  Sal      Type      Cat    St      Desc  Seen  Exp  Posted  Added        Company        Title")
+    print("---  --  -------  --------  -----  ------  ----  ----  ---  ------  -----------  -------------  -----")
     for row in rows:
         print(
             f"{row['id']:<3}  "
@@ -171,6 +222,7 @@ def list_jobs() -> int:
             f"{_format_table_employment_type(row):<8}  "
             f"{_format_table_category(row['category']):<5}  "
             f"{_format_table_status(row['status']):<6}  "
+            f"{_format_description_status(row):<4}  "
             f"{row['seen_count']:<4}  "
             f"{_yes_no_short(row['is_expired']):<3}  "
             f"{_format_posted_age(row['posted_date']):<6}  "
@@ -178,7 +230,6 @@ def list_jobs() -> int:
             f"{_truncate(_console_text(row['company']), 13):<13}  "
             f"{_truncate(_console_text(row['title']), 76)}"
         )
-    return 0
 
 
 def digest_jobs(
@@ -209,11 +260,12 @@ def digest_jobs(
 
 
 def send_telegram_digest(
-    since_hours: int = 24,
+    since_hours: int = 48,
     limit: int = 5,
     include_investigate: bool = False,
-    minimum_score: int = 85,
+    minimum_score: int | None = None,
     now: datetime | None = None,
+    max_seen_count: int = 3,
 ) -> int:
     """Send a concise Telegram digest of high-priority stored jobs."""
 
@@ -223,12 +275,14 @@ def send_telegram_digest(
         include_investigate=include_investigate,
         minimum_score=minimum_score,
         now=now,
+        max_seen_count=max_seen_count,
     )
     message = _render_telegram_digest(
         rows,
         since_hours=since_hours,
         include_investigate=include_investigate,
         minimum_score=minimum_score,
+        max_seen_count=max_seen_count,
     )
     send_telegram_message(message)
     print(f"Sent Telegram digest with {len(rows)} job(s).")
@@ -259,6 +313,15 @@ def show_job(job_id: int) -> int:
     print(f"Expired: {_yes_no(row['is_expired'])}")
     print(f"Posted: {row['posted_date'] or 'Unknown'}")
     print(f"Link: {row['job_link'] or 'No job URL found'}")
+    print(f"Source URL: {row['source_url'] or row['job_link'] or 'No source URL found'}")
+    print(f"Canonical URL: {row['canonical_url'] or 'Unknown'}")
+    print(f"Description fetched: {_yes_no(row['job_description'])}")
+    print(f"Description status: {row['description_status'] or 'Unknown'}")
+    print(f"Description source: {row['description_source'] or 'Unknown'}")
+    if row["job_description_fetched_at"]:
+        print(f"Description fetched at: {row['job_description_fetched_at']}")
+    if row["job_description_error"]:
+        print(f"Description fetch error: {row['job_description_error']}")
     print(f"Seen: {row['seen_count']} time(s)")
     print(f"First seen: {row['first_seen_at']}")
     print(f"Last seen: {row['last_seen_at']}")
@@ -266,6 +329,10 @@ def show_job(job_id: int) -> int:
     print(f"Updated in Beacon: {row['updated_at']}")
     print(f"Source: {row['source_email'] or 'Unknown'}")
     print(f"Why: {row['explanation']}")
+    if row["job_description"]:
+        print()
+        print("Description:")
+        print(_console_text(row["job_description"]))
     return 0
 
 
@@ -286,6 +353,67 @@ def set_job_status(job_id: int, status: str) -> int:
         return 1
 
     print(f"Updated job {job_id} status to {status}.")
+    return 0
+
+
+def fetch_job_descriptions(
+    limit: int = 5,
+    include_investigate: bool = False,
+    force: bool = False,
+    timeout: int = 20,
+) -> int:
+    """Fetch full posting text for stored jobs before AI reasoning."""
+
+    connection = initialize_storage()
+    rows = [
+        row
+        for row in fetch_all_jobs(connection)
+        if _should_fetch_job_description(row, include_investigate=include_investigate, force=force)
+    ][:limit]
+
+    if not rows:
+        connection.close()
+        print("No job descriptions need fetching.")
+        return 0
+
+    print(f"Fetching descriptions for {len(rows)} job(s).")
+    success_count = 0
+    for row in rows:
+        description_url, description_source = _description_fetch_target(row)
+        if not description_url:
+            update_job_description(
+                connection=connection,
+                job_id=row["id"],
+                description=None,
+                final_url=row["source_url"] or row["job_link"],
+                error="LinkedIn alert URL has no canonical posting URL.",
+                description_status="linkedin_blocked",
+                description_source="linkedin_alert_only",
+            )
+            print(
+                f"- {row['id']}: blocked for {row['company']} - {row['title']} "
+                "(linkedin_blocked)"
+            )
+            continue
+
+        result = fetch_job_description(description_url, timeout=timeout)
+        update_job_description(
+            connection=connection,
+            job_id=row["id"],
+            description=result.description,
+            final_url=result.final_url,
+            error=result.error,
+            description_status="fetched" if result.description else "fetch_failed",
+            description_source=description_source,
+        )
+        if result.description:
+            success_count += 1
+            print(f"- {row['id']}: fetched {len(result.description)} chars for {row['company']} - {row['title']}")
+        else:
+            print(f"- {row['id']}: failed for {row['company']} - {row['title']} ({result.error})")
+
+    connection.close()
+    print(f"Stored {success_count} fetched description(s).")
     return 0
 
 
@@ -516,7 +644,7 @@ def build_parser() -> argparse.ArgumentParser:
     cycle_parser.add_argument(
         "--since-hours",
         type=int,
-        default=2,
+        default=48,
         help="Only send jobs first seen within this many hours.",
     )
     cycle_parser.add_argument(
@@ -533,8 +661,31 @@ def build_parser() -> argparse.ArgumentParser:
     cycle_parser.add_argument(
         "--minimum-score",
         type=int,
-        default=85,
-        help="Only send jobs with at least this score.",
+        default=None,
+        help="Optionally only send jobs with at least this score.",
+    )
+    cycle_parser.add_argument(
+        "--max-seen-count",
+        type=int,
+        default=3,
+        help="Only send jobs seen fewer times than this number.",
+    )
+    cycle_parser.add_argument(
+        "--skip-description-fetch",
+        action="store_true",
+        help="Do not fetch full job descriptions during the cycle.",
+    )
+    cycle_parser.add_argument(
+        "--description-limit",
+        type=int,
+        default=5,
+        help="Maximum number of job descriptions to fetch during the cycle.",
+    )
+    cycle_parser.add_argument(
+        "--description-timeout",
+        type=int,
+        default=20,
+        help="HTTP timeout per job description fetch in seconds.",
     )
     cycle_parser.add_argument(
         "--skip-telegram-poll",
@@ -557,9 +708,14 @@ def build_parser() -> argparse.ArgumentParser:
         "list-gmail-mailboxes",
         help="List Gmail IMAP mailbox names for label configuration.",
     )
-    subparsers.add_parser(
+    list_jobs_parser = subparsers.add_parser(
         "list-jobs",
         help="List stored jobs from SQLite.",
+    )
+    list_jobs_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show a wider diagnostic table with enrichment and parsing signals.",
     )
     digest_parser = subparsers.add_parser(
         "digest",
@@ -589,7 +745,7 @@ def build_parser() -> argparse.ArgumentParser:
     telegram_parser.add_argument(
         "--since-hours",
         type=int,
-        default=24,
+        default=48,
         help="Only include jobs added within this many hours.",
     )
     telegram_parser.add_argument(
@@ -606,8 +762,14 @@ def build_parser() -> argparse.ArgumentParser:
     telegram_parser.add_argument(
         "--minimum-score",
         type=int,
-        default=85,
-        help="Only send jobs with at least this score.",
+        default=None,
+        help="Optionally only send jobs with at least this score.",
+    )
+    telegram_parser.add_argument(
+        "--max-seen-count",
+        type=int,
+        default=3,
+        help="Only send jobs seen fewer times than this number.",
     )
     poll_telegram_parser = subparsers.add_parser(
         "poll-telegram",
@@ -636,6 +798,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     status_parser.add_argument("job_id", type=int)
     status_parser.add_argument("status")
+    fetch_descriptions_parser = subparsers.add_parser(
+        "fetch-job-descriptions",
+        help="Fetch full posting text for stored jobs with URLs.",
+    )
+    fetch_descriptions_parser.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="Maximum number of job pages to fetch.",
+    )
+    fetch_descriptions_parser.add_argument(
+        "--include-investigate",
+        action="store_true",
+        help="Fetch Investigate jobs in addition to Apply now jobs.",
+    )
+    fetch_descriptions_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Fetch again even if a description was already stored.",
+    )
+    fetch_descriptions_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=20,
+        help="HTTP timeout per job page in seconds.",
+    )
     cleanup_parser = subparsers.add_parser(
         "cleanup-non-jobs",
         help="Preview or delete obvious non-job rows from SQLite.",
@@ -701,6 +889,10 @@ def main() -> int:
                 telegram_limit=args.telegram_limit,
                 include_investigate=args.include_investigate,
                 minimum_score=args.minimum_score,
+                max_seen_count=args.max_seen_count,
+                fetch_descriptions=not args.skip_description_fetch,
+                description_limit=args.description_limit,
+                description_timeout=args.description_timeout,
                 poll_telegram_replies=not args.skip_telegram_poll,
                 poll_limit=args.poll_limit,
                 poll_timeout=args.poll_timeout,
@@ -708,7 +900,7 @@ def main() -> int:
         if args.command == "list-gmail-mailboxes":
             return list_gmail_mailboxes()
         if args.command == "list-jobs":
-            return list_jobs()
+            return list_jobs(debug=args.debug)
         if args.command == "digest":
             return digest_jobs(
                 since_hours=args.since_hours,
@@ -721,6 +913,7 @@ def main() -> int:
                 limit=args.limit,
                 include_investigate=args.include_investigate,
                 minimum_score=args.minimum_score,
+                max_seen_count=args.max_seen_count,
             )
         if args.command == "poll-telegram":
             return poll_telegram(limit=args.limit, timeout=args.timeout)
@@ -728,6 +921,13 @@ def main() -> int:
             return show_job(args.job_id)
         if args.command == "update-status":
             return set_job_status(args.job_id, args.status)
+        if args.command == "fetch-job-descriptions":
+            return fetch_job_descriptions(
+                limit=args.limit,
+                include_investigate=args.include_investigate,
+                force=args.force,
+                timeout=args.timeout,
+            )
         if args.command == "cleanup-non-jobs":
             return cleanup_non_jobs(apply=args.apply)
         if args.command == "cleanup-skipped":
@@ -839,6 +1039,18 @@ def _format_table_status(value: str) -> str:
     return aliases.get(value, _truncate(value, 6))
 
 
+def _format_description_status(row: object) -> str:
+    """Show whether Beacon has fetched a full job description."""
+
+    if row["job_description"]:
+        return "Y"
+    if row["description_status"] == "linkedin_blocked":
+        return "Blk"
+    if row["job_description_error"]:
+        return "Err"
+    return "N"
+
+
 def _parse_stored_timestamp(value: str | None, fallback: datetime) -> datetime:
     """Parse a stored SQLite timestamp and normalize it for time filtering."""
 
@@ -859,8 +1071,9 @@ def _recent_digest_rows(
     since_hours: int,
     limit: int,
     include_investigate: bool,
-    minimum_score: int = 0,
+    minimum_score: int | None = None,
     now: datetime | None = None,
+    max_seen_count: int | None = None,
 ) -> list[object]:
     """Return stored rows eligible for digest-style output."""
 
@@ -875,10 +1088,42 @@ def _recent_digest_rows(
         row
         for row in rows
         if row["category"] in visible_categories
+        and row["status"] == "New"
         and not row["is_expired"]
-        and row["score"] >= minimum_score
+        and (minimum_score is None or row["score"] >= minimum_score)
+        and (max_seen_count is None or row["seen_count"] < max_seen_count)
         and _parse_stored_timestamp(row["first_seen_at"], fallback=current_time) >= cutoff
     ][:limit]
+
+
+def _should_fetch_job_description(row: object, include_investigate: bool, force: bool) -> bool:
+    """Return whether a stored job is a good candidate for page enrichment."""
+
+    visible_categories = ("Apply now", "Investigate") if include_investigate else ("Apply now",)
+    if row["category"] not in visible_categories:
+        return False
+    if row["status"] != "New":
+        return False
+    if row["is_expired"]:
+        return False
+    if not (row["canonical_url"] or row["source_url"] or row["job_link"]):
+        return False
+    if not force and row["job_description"]:
+        return False
+    return True
+
+
+def _description_fetch_target(row: object) -> tuple[str | None, str]:
+    """Return the URL Beacon should fetch for description text and its source."""
+
+    if row["canonical_url"]:
+        return row["canonical_url"], "canonical_url"
+
+    source_url = row["source_url"] or row["job_link"]
+    resolution = resolve_source_job_url(source_url)
+    if not resolution.should_fetch_description:
+        return None, resolution.description_source or "linkedin_alert_only"
+    return source_url, "source_url"
 
 
 def _render_stored_digest(rows: list[object], since_hours: int, include_investigate: bool) -> str:
@@ -902,20 +1147,29 @@ def _render_telegram_digest(
     rows: list[object],
     since_hours: int,
     include_investigate: bool,
-    minimum_score: int,
+    minimum_score: int | None,
+    max_seen_count: int | None = None,
 ) -> str:
     """Render a compact plain-text Telegram job digest."""
 
     categories = "Apply now and Investigate" if include_investigate else "Apply now"
+    filters = []
+    if minimum_score is not None:
+        filters.append(f"score >= {minimum_score}")
+    if max_seen_count is not None:
+        filters.append(f"seen < {max_seen_count}")
+    filter_text = ""
+    if filters:
+        filter_text = " with " + " and ".join(filters)
     if not rows:
         return (
             f"Beacon: no {categories} jobs found in the last {since_hours} "
-            f"hour(s) with score >= {minimum_score}."
+            f"hour(s){filter_text}."
         )
 
     lines = [
         f"Beacon digest: {len(rows)} {categories} job(s)",
-        f"Window: last {since_hours} hour(s), score >= {minimum_score}",
+        f"Window: last {since_hours} hour(s){filter_text}",
         "",
     ]
     for rank, row in enumerate(rows, 1):
