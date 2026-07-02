@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from .config import DEFAULT_PREFERENCES
 from .models import JobOpportunity, SourceEmail
+from .normalization import normalize_company, normalize_title
 
 TECH_SKILLS = (
     "Python",
@@ -87,6 +88,7 @@ def parse_email(email: SourceEmail, now: datetime | None = None) -> list[JobOppo
         job_link=_extract_first_url(body),
         source_email=email.sender,
         posted_date=_posted_age(email, now),
+        is_expired=_is_expired(email, now),
     )
     return [job]
 
@@ -111,6 +113,10 @@ def _extract_title(email: SourceEmail) -> str | None:
         return _clean_title(hiring_match.group("title"))
 
     subject = _strip_subject_prefix(email.subject)
+    company_hiring_match = _company_is_hiring_match(subject) or _company_is_hiring_match(email.body)
+    if company_hiring_match:
+        return _clean_title(company_hiring_match.group("title"))
+
     contract_match = _contract_opportunity_match(subject)
     if contract_match:
         return _clean_title(contract_match.group("title"))
@@ -142,6 +148,10 @@ def _extract_company(email: SourceEmail, title: str | None) -> str:
         return body_company
 
     subject = _strip_subject_prefix(email.subject)
+    company_hiring_match = _company_is_hiring_match(subject) or _company_is_hiring_match(email.body)
+    if company_hiring_match:
+        return _clean_company(company_hiring_match.group("company"))
+
     contract_match = _contract_opportunity_match(subject)
     if contract_match:
         return _clean_company(contract_match.group("company"))
@@ -359,19 +369,108 @@ def _estimate_posted_at(received_at: datetime, posted_age: str) -> datetime | No
 
 
 def _age_text(reference_time: datetime, now: datetime | None = None) -> str:
-    """Return a compact age string such as `0 days ago` or `3 days ago`."""
+    """Return compact age text, preserving useful recent-posting precision."""
 
     current_time = now or datetime.now(UTC)
     if reference_time.tzinfo is None:
         reference_time = reference_time.replace(tzinfo=UTC)
 
     age = current_time - reference_time.astimezone(UTC)
+    total_seconds = max(0, int(age.total_seconds()))
+    if total_seconds < 120:
+        return "1 minute ago"
+    if total_seconds < 3600:
+        return f"{total_seconds // 60} minutes ago"
+    if total_seconds < 7200:
+        return "1 hour ago"
+    if total_seconds < 86400:
+        return f"{total_seconds // 3600} hours ago"
+
     age_days = max(0, age.days)
-    if age_days == 0:
-        return "0 days ago"
     if age_days == 1:
         return "1 day ago"
     return f"{age_days} days ago"
+
+
+def _is_expired(email: SourceEmail, now: datetime | None = None) -> bool:
+    """Detect alerts for jobs that are no longer actionable."""
+
+    text = f"{email.subject}\n{email.body}"
+    lower = text.casefold()
+    expired_markers = (
+        "job expired",
+        "job has expired",
+        "job is expired",
+        "no longer accepting applications",
+        "no longer available",
+        "position has closed",
+        "posting has closed",
+        "this job is no longer available",
+        "this job posting has expired",
+    )
+    if any(marker in lower for marker in expired_markers):
+        return True
+
+    expiration_date = _extract_expiration_date(text, now)
+    if not expiration_date:
+        return False
+
+    current_date = (now or datetime.now(UTC)).date()
+    return expiration_date < current_date
+
+
+def _extract_expiration_date(text: str, now: datetime | None = None) -> date | None:
+    """Parse simple expiry dates such as `expiring on Jul 2`."""
+
+    match = re.search(
+        r"\b(?:expiring|expires|deadline)\s+(?:on\s+)?(?P<month>[A-Za-z]{3,9})\.?\s+(?P<day>\d{1,2})\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    month_lookup = {
+        "jan": 1,
+        "january": 1,
+        "feb": 2,
+        "february": 2,
+        "mar": 3,
+        "march": 3,
+        "apr": 4,
+        "april": 4,
+        "may": 5,
+        "jun": 6,
+        "june": 6,
+        "jul": 7,
+        "july": 7,
+        "aug": 8,
+        "august": 8,
+        "sep": 9,
+        "sept": 9,
+        "september": 9,
+        "oct": 10,
+        "october": 10,
+        "nov": 11,
+        "november": 11,
+        "dec": 12,
+        "december": 12,
+    }
+    month_text = match.group("month").casefold().rstrip(".")
+    month = month_lookup.get(month_text)
+    if month is None:
+        return None
+
+    current_date = (now or datetime.now(UTC)).date()
+    try:
+        expiration_date = date(current_date.year, month, int(match.group("day")))
+    except ValueError:
+        return None
+
+    # Alerts around New Year may refer to a date in the next year.
+    if expiration_date.month < current_date.month - 6:
+        expiration_date = date(current_date.year + 1, expiration_date.month, expiration_date.day)
+    return expiration_date
 
 
 def _strip_subject_prefix(subject: str) -> str:
@@ -428,11 +527,26 @@ def _contract_opportunity_match(subject: str) -> re.Match[str] | None:
     )
 
 
+def _company_is_hiring_match(text: str) -> re.Match[str] | None:
+    """Parse LinkedIn snippets like `StackAdapt is hiring a Senior ML Scientist`."""
+
+    title_pattern = (
+        r"(?:Senior/Staff\s+|Senior\s+|Staff\s+)?(?:Applied\s+)?(?:Data Scientist|"
+        r"Machine Learning Scientist|Machine Learning Engineer|ML Scientist|"
+        r"ML Engineer|AI Engineer|Applied AI Engineer)"
+    )
+    return re.search(
+        rf"(?P<company>[A-Z][A-Za-z0-9&.' -]+?)\s+is hiring\s+(?:a |an )?"
+        rf"(?P<title>{title_pattern})(?P<suffix>\s*\([^)]*\))?",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
 def _clean_title(value: str) -> str:
     """Trim punctuation that often appears around parsed subject fragments."""
 
-    cleaned = value.strip(" -*")
-    cleaned = re.sub(r"\s+-\s+\d+\s*$", "", cleaned)
+    cleaned = normalize_title(value)
     exciting_match = re.search(
         r"(?:exciting\s+)?(?P<title>(?:senior\s+|staff\s+)?(?:machine learning engineer|"
         r"ml engineer|data scientist|ai engineer|applied ai engineer))\b",
@@ -440,17 +554,14 @@ def _clean_title(value: str) -> str:
         flags=re.IGNORECASE,
     )
     if exciting_match:
-        return _preserve_role_acronyms(exciting_match.group("title").title())
-    return _preserve_role_acronyms(cleaned)
+        return normalize_title(exciting_match.group("title").title())
+    return cleaned
 
 
 def _clean_company(value: str) -> str:
     """Trim punctuation that often appears around parsed company fragments."""
 
-    cleaned = value.strip(" -*")
-    if ":" in cleaned:
-        cleaned = cleaned.split(":", 1)[0].strip()
-    return cleaned
+    return normalize_company(value)
 
 
 def _next_nonempty_line(lines: list[str], start_index: int) -> str | None:
@@ -501,17 +612,3 @@ def _company_from_body(text: str) -> str | None:
     if contract_match:
         return _clean_company(contract_match.group("company"))
     return None
-
-
-def _preserve_role_acronyms(value: str) -> str:
-    """Keep common AI/ML acronyms uppercase after title cleanup."""
-
-    replacements = {
-        "Ai": "AI",
-        "Ml": "ML",
-        "Llm": "LLM",
-        "Rag": "RAG",
-    }
-    for source, target in replacements.items():
-        value = re.sub(rf"\b{source}\b", target, value)
-    return value

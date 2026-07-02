@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import unittest
 
+from beacon.config import DEFAULT_PREFERENCES
 from beacon.models import JobOpportunity
 from beacon.scorer import score_job
 
@@ -140,6 +142,111 @@ class ScorerTests(unittest.TestCase):
         self.assertEqual(scored.category, "Apply now")
         self.assertIn("tier A company preference: Waabi", scored.explanation)
 
+    def test_personal_company_whitelist_adds_priority_boost(self) -> None:
+        """Personal whitelist companies should get a stronger custom boost."""
+        preferences = replace(
+            DEFAULT_PREFERENCES,
+            personal_company_whitelist=("reddit",),
+        )
+        job = JobOpportunity(
+            company="Reddit, Inc.",
+            title="Staff Data Scientist, Marketing",
+            location=None,
+            work_mode="Remote",
+            salary_range=None,
+            seniority="Staff",
+            required_skills=("Experimentation", "Incrementality", "Customer Growth"),
+            job_link="https://example.com/reddit",
+        )
+
+        baseline = score_job(job)
+        boosted = score_job(job, preferences)
+
+        self.assertGreater(boosted.score, baseline.score)
+        self.assertIn("personal company whitelist: Reddit", boosted.explanation)
+
+    def test_personal_company_blacklist_forces_skip(self) -> None:
+        """A blacklisted company should be skipped even if the role is strong."""
+        preferences = replace(
+            DEFAULT_PREFERENCES,
+            personal_company_blacklist=("cohere",),
+        )
+        job = JobOpportunity(
+            company="Cohere",
+            title="Senior Applied AI Engineer",
+            location="Remote Canada",
+            work_mode="Remote",
+            salary_range="CA$180k-250k",
+            seniority="Senior",
+            required_skills=("LLM", "RAG", "AI Agents", "Evaluation Frameworks"),
+            preferred_skills=("Databricks", "MLflow", "Kubernetes"),
+            job_link="https://example.com/cohere",
+        )
+
+        scored = score_job(job, preferences)
+
+        self.assertEqual(scored.score, 0)
+        self.assertEqual(scored.category, "Skip")
+        self.assertIn("company is on personal blacklist: Cohere", scored.explanation)
+
+    def test_personal_company_blacklist_wins_over_whitelist(self) -> None:
+        """Conflicting personal preferences should fail closed as Skip."""
+        preferences = replace(
+            DEFAULT_PREFERENCES,
+            personal_company_whitelist=("doppel",),
+            personal_company_blacklist=("doppel",),
+        )
+        job = JobOpportunity(
+            company="Doppel",
+            title="Machine Learning Engineer, Detection Systems",
+            seniority="Senior",
+            required_skills=("Machine Learning", "ML Systems", "Detection Systems"),
+            job_link="https://example.com/doppel",
+        )
+
+        scored = score_job(job, preferences)
+
+        self.assertEqual(scored.score, 0)
+        self.assertEqual(scored.category, "Skip")
+        self.assertIn("company is on personal blacklist: Doppel", scored.explanation)
+        self.assertNotIn("personal company whitelist", scored.explanation)
+
+    def test_stackadapt_does_not_match_ada_by_substring(self) -> None:
+        """Company matching should not find Ada inside StackAdapt."""
+        job = JobOpportunity(
+            company="StackAdapt",
+            title="Applied Machine Learning Scientist",
+            location=None,
+            salary_range=None,
+            seniority=None,
+            required_skills=("Machine Learning", "LLM"),
+            job_link="https://example.com/stackadapt",
+        )
+
+        scored = score_job(job)
+
+        self.assertIn("tier A company preference: StackAdapt", scored.explanation)
+        self.assertIn("strategic next step: StackAdapt moves toward AI engineering", scored.explanation)
+        self.assertNotIn("Ada moves", scored.explanation)
+
+    def test_scoring_normalizes_company_and_title_before_explaining(self) -> None:
+        """Scorer output should carry normalized display fields forward."""
+        job = JobOpportunity(
+            company=" mongodb ",
+            title="senior ai engineer (remote)",
+            location=None,
+            salary_range=None,
+            seniority="Senior",
+            required_skills=("LLM", "RAG"),
+            job_link="https://example.com/mongodb",
+        )
+
+        scored = score_job(job)
+
+        self.assertEqual(scored.job.company, "MongoDB")
+        self.assertEqual(scored.job.title, "Senior AI Engineer")
+        self.assertIn("tier B company preference: MongoDB", scored.explanation)
+
     def test_tier_b_companies_get_smaller_priority_boost(self) -> None:
         """Tier B companies should be preferred, but less strongly than Tier A."""
         job = JobOpportunity(
@@ -249,6 +356,64 @@ class ScorerTests(unittest.TestCase):
         self.assertEqual(scored.category, "Skip")
         self.assertIn("limited strategic movement", scored.explanation)
 
+    def test_contract_roles_get_explicit_penalty(self) -> None:
+        """Contract roles should be explainably lower priority than permanent roles."""
+        permanent_job = JobOpportunity(
+            company="Scotiabank",
+            title="Data Scientist, Global AI and ML",
+            location="Toronto",
+            work_mode="Hybrid",
+            salary_range="CA$190,000",
+            seniority="Senior",
+            required_skills=("LLM", "RAG", "Machine Learning"),
+            job_link="https://example.com/scotia-ai",
+        )
+        contract_job = JobOpportunity(
+            company="Scotiabank",
+            title="Data Scientist, Global AI and ML Contract",
+            location="Toronto",
+            work_mode="Hybrid",
+            salary_range="CA$190,000",
+            seniority="Senior",
+            required_skills=("LLM", "RAG", "Machine Learning"),
+            job_link="https://example.com/scotia-ai-contract",
+        )
+
+        permanent = score_job(permanent_job)
+        contract = score_job(contract_job)
+
+        self.assertLess(contract.score, permanent.score)
+        self.assertIn("contract role is less preferred", contract.explanation)
+
+    def test_relocation_roles_get_strong_penalty(self) -> None:
+        """Roles requiring relocation should lose priority clearly."""
+        remote_job = JobOpportunity(
+            company="Cohere",
+            title="Senior Applied AI Engineer",
+            location="Remote Canada",
+            work_mode="Remote",
+            salary_range="CA$180k-250k",
+            seniority="Senior",
+            required_skills=("LLM", "RAG", "AI Agents"),
+            job_link="https://example.com/cohere-remote",
+        )
+        relocation_job = JobOpportunity(
+            company="Cohere",
+            title="Senior Applied AI Engineer",
+            location="San Francisco, relocation required",
+            work_mode="On-site",
+            salary_range="CA$180k-250k",
+            seniority="Senior",
+            required_skills=("LLM", "RAG", "AI Agents"),
+            job_link="https://example.com/cohere-relocation",
+        )
+
+        remote = score_job(remote_job)
+        relocation = score_job(relocation_job)
+
+        self.assertLess(relocation.score, remote.score)
+        self.assertIn("relocation requirement is a preference mismatch", relocation.explanation)
+
     def test_prioritizes_senior_data_scientist_in_relevant_business_domain(self) -> None:
         """Marketing, loyalty, and personalization DS roles should get a boost."""
         job = JobOpportunity(
@@ -285,8 +450,8 @@ class ScorerTests(unittest.TestCase):
         self.assertLess(scored.score, 80)
         self.assertNotIn("relevant DS domain signal", scored.explanation)
 
-    def test_posted_date_does_not_affect_score(self) -> None:
-        """Unreliable posted-date text should stay metadata, not score input."""
+    def test_recent_posted_date_does_not_affect_score(self) -> None:
+        """Recent posted-date text should not create a freshness boost."""
         fresh_job = JobOpportunity(
             company="Cohere",
             title="Senior Applied AI Engineer",
@@ -308,6 +473,127 @@ class ScorerTests(unittest.TestCase):
         self.assertEqual(fresh.score, older.score)
         self.assertNotIn("fresh posting", fresh.explanation)
         self.assertNotIn("older posting", older.explanation)
+
+    def test_jobs_posted_within_two_hours_are_highlighted(self) -> None:
+        """Very recent postings should be highlighted without changing score."""
+        fresh_job = JobOpportunity(
+            company="Cohere",
+            title="Senior Applied AI Engineer",
+            seniority="Senior",
+            required_skills=("LLM", "RAG", "AI Agents"),
+            posted_date="37 minutes ago",
+            job_link="https://example.com/fresh",
+        )
+        vague_same_day_job = JobOpportunity(
+            company="Cohere",
+            title="Senior Applied AI Engineer",
+            seniority="Senior",
+            required_skills=("LLM", "RAG", "AI Agents"),
+            posted_date="0 days ago",
+            job_link="https://example.com/same-day",
+        )
+
+        fresh = score_job(fresh_job)
+        vague_same_day = score_job(vague_same_day_job)
+
+        self.assertEqual(fresh.score, vague_same_day.score)
+        self.assertIn("fresh posting: posted within the last 2 hours", fresh.explanation)
+        self.assertNotIn("fresh posting", vague_same_day.explanation)
+
+    def test_jobs_posted_more_than_two_hours_ago_are_not_highlighted(self) -> None:
+        """A few-hours-old role should not get the urgent fresh-posting marker."""
+        job = JobOpportunity(
+            company="Cohere",
+            title="Senior Applied AI Engineer",
+            seniority="Senior",
+            required_skills=("LLM", "RAG", "AI Agents"),
+            posted_date="3 hours ago",
+            job_link="https://example.com/older-today",
+        )
+
+        scored = score_job(job)
+
+        self.assertNotIn("fresh posting", scored.explanation)
+
+    def test_postings_older_than_two_weeks_are_expired(self) -> None:
+        """Clearly old postings should be removed from the action list."""
+        old_job = JobOpportunity(
+            company="Cohere",
+            title="Senior Applied AI Engineer",
+            seniority="Senior",
+            required_skills=("LLM", "RAG", "AI Agents"),
+            posted_date="14 days ago",
+            job_link="https://example.com/old",
+        )
+
+        scored = score_job(old_job)
+
+        self.assertTrue(scored.job.is_expired)
+        self.assertEqual(scored.score, 0)
+        self.assertEqual(scored.category, "Skip")
+        self.assertIn("posting is more than 2 weeks old: 14 days", scored.explanation)
+        self.assertIn("job appears expired", scored.explanation)
+
+    def test_postings_under_two_weeks_are_not_expired_by_age(self) -> None:
+        """Beacon should not expire jobs before the two-week cutoff."""
+        recent_job = JobOpportunity(
+            company="Cohere",
+            title="Senior Applied AI Engineer",
+            seniority="Senior",
+            required_skills=("LLM", "RAG", "AI Agents"),
+            posted_date="13 days ago",
+            job_link="https://example.com/recent",
+        )
+
+        scored = score_job(recent_job)
+
+        self.assertFalse(scored.job.is_expired)
+        self.assertNotEqual(scored.score, 0)
+        self.assertNotIn("job appears expired", scored.explanation)
+
+    def test_old_posting_expiry_parses_weeks_and_months(self) -> None:
+        """LinkedIn-style week/month ages should also expire old postings."""
+        weeks_old_job = JobOpportunity(
+            company="Cohere",
+            title="Senior Applied AI Engineer",
+            seniority="Senior",
+            required_skills=("LLM", "RAG", "AI Agents"),
+            posted_date="3 weeks ago",
+            job_link="https://example.com/weeks-old",
+        )
+        months_old_job = JobOpportunity(
+            company="Cohere",
+            title="Senior Applied AI Engineer",
+            seniority="Senior",
+            required_skills=("LLM", "RAG", "AI Agents"),
+            posted_date="2 months ago",
+            job_link="https://example.com/months-old",
+        )
+
+        weeks_old = score_job(weeks_old_job)
+        months_old = score_job(months_old_job)
+
+        self.assertTrue(weeks_old.job.is_expired)
+        self.assertTrue(months_old.job.is_expired)
+        self.assertIn("posting is more than 2 weeks old: 21 days", weeks_old.explanation)
+        self.assertIn("posting is more than 2 weeks old: 60 days", months_old.explanation)
+
+    def test_expired_jobs_are_skipped_even_when_otherwise_strong(self) -> None:
+        """Expired roles should not remain actionable recommendations."""
+        job = JobOpportunity(
+            company="Cohere",
+            title="Senior Applied AI Engineer",
+            seniority="Senior",
+            required_skills=("LLM", "RAG", "AI Agents"),
+            job_link="https://example.com/expired",
+            is_expired=True,
+        )
+
+        scored = score_job(job)
+
+        self.assertEqual(scored.score, 0)
+        self.assertEqual(scored.category, "Skip")
+        self.assertIn("job appears expired", scored.explanation)
 
 
 if __name__ == "__main__":

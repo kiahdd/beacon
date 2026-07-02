@@ -39,6 +39,8 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(rows[0]["title"], "Senior Applied AI Engineer")
         self.assertEqual(rows[0]["status"], "New")
         self.assertEqual(rows[0]["seen_count"], 1)
+        self.assertEqual(rows[0]["is_expired"], 0)
+        self.assertEqual(rows[0]["salary_estimate"], 215_000)
         self.assertEqual(rows[0]["score"], 95)
         self.assertEqual(rows[0]["created_at"], "2026-06-29T12:00:00+00:00")
         self.assertEqual(rows[0]["updated_at"], "2026-06-29T12:00:00+00:00")
@@ -71,6 +73,40 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(rows[0]["created_at"], "2026-06-29T12:00:00+00:00")
         self.assertEqual(rows[0]["updated_at"], "2026-06-30T12:00:00+00:00")
 
+    def test_storage_normalizes_company_and_title_before_insert(self) -> None:
+        """Storage should not persist messy display identity fields."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            connection = initialize_storage(Path(temp_dir) / "beacon.db")
+            upsert_scored_jobs(
+                [
+                    _scored_job(
+                        company=" mongodb ",
+                        title="senior ai engineer (remote)",
+                    )
+                ],
+                connection,
+                seen_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+            )
+            rows = fetch_all_jobs(connection)
+            connection.close()
+
+        self.assertEqual(rows[0]["company"], "MongoDB")
+        self.assertEqual(rows[0]["title"], "Senior AI Engineer")
+
+    def test_storage_persists_expired_flag(self) -> None:
+        """Expired status should survive insertion into SQLite."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            connection = initialize_storage(Path(temp_dir) / "beacon.db")
+            upsert_scored_jobs(
+                [_scored_job(company="Cohere", title="Senior Applied AI Engineer", is_expired=True)],
+                connection,
+                seen_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+            )
+            rows = fetch_all_jobs(connection)
+            connection.close()
+
+        self.assertEqual(rows[0]["is_expired"], 1)
+
     def test_initialization_migrates_older_databases_with_timestamps(self) -> None:
         """Older local DBs should gain created_at and updated_at automatically."""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -90,6 +126,27 @@ class StorageTests(unittest.TestCase):
 
         self.assertIn("created_at", columns)
         self.assertIn("updated_at", columns)
+
+    def test_initialization_migrates_salary_estimate_column(self) -> None:
+        """Older local DBs should gain salary estimates from existing salary text."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "beacon.db"
+            connection = initialize_storage(db_path)
+            upsert_scored_jobs([_scored_job(company="Cohere", title="Senior Applied AI Engineer")], connection)
+            connection.execute("ALTER TABLE jobs DROP COLUMN salary_estimate")
+            connection.commit()
+            connection.close()
+
+            migrated_connection = initialize_storage(db_path)
+            columns = {
+                row["name"]
+                for row in migrated_connection.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            row = fetch_all_jobs(migrated_connection)[0]
+            migrated_connection.close()
+
+        self.assertIn("salary_estimate", columns)
+        self.assertEqual(row["salary_estimate"], 215_000)
 
     def test_fingerprint_uses_dedupe_identity_fields(self) -> None:
         """Case and whitespace differences should not change the fingerprint."""
@@ -113,7 +170,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(row["company"], "Cohere")
         self.assertIsNone(missing)
 
-    def test_fetch_all_jobs_orders_by_category_then_newest_created_at(self) -> None:
+    def test_fetch_all_jobs_orders_by_category_then_newest_first_seen_at(self) -> None:
         """The review list should show Apply now jobs first, newest first."""
         with tempfile.TemporaryDirectory() as temp_dir:
             connection = initialize_storage(Path(temp_dir) / "beacon.db")
@@ -170,6 +227,7 @@ def _scored_job(
     title: str,
     score: int = 95,
     category: str = "Apply now",
+    is_expired: bool = False,
 ) -> ScoredJob:
     job = JobOpportunity(
         company=company,
@@ -183,6 +241,7 @@ def _scored_job(
         job_link="https://cohere.ai/careers/123456",
         source_email="LinkedIn Jobs",
         posted_date="12 minutes ago",
+        is_expired=is_expired,
     )
     return ScoredJob(
         job=job,

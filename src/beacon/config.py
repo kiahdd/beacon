@@ -21,6 +21,8 @@ class CareerPreferences:
     tier_a_companies: tuple[str, ...] = ()
     tier_b_companies: tuple[str, ...] = ()
     tier_c_companies: tuple[str, ...] = ()
+    personal_company_whitelist: tuple[str, ...] = ()
+    personal_company_blacklist: tuple[str, ...] = ()
     ai_native_companies: tuple[str, ...] = ()
     strategic_direction_keywords: tuple[str, ...] = ()
     limited_direction_keywords: tuple[str, ...] = ()
@@ -164,6 +166,10 @@ DEFAULT_PREFERENCES = CareerPreferences(
         "loblaw",
         "canadian tire",
     ),
+    # These personal lists intentionally start empty. Add companies here when
+    # Beacon should always pay extra attention to them, or always skip them.
+    personal_company_whitelist=(),
+    personal_company_blacklist=(),
     ai_native_companies=(
         "doppel",
         "cohere",

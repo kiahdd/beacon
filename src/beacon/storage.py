@@ -6,8 +6,10 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .compensation import estimate_salary
 from .dedupe import job_identity_key
 from .models import ScoredJob
+from .normalization import normalize_scored_job
 
 
 DEFAULT_DB_PATH = Path("data/beacon.db")
@@ -41,7 +43,7 @@ def upsert_scored_jobs(
 
     timestamp = (seen_at or datetime.now(UTC)).isoformat()
     for scored_job in scored_jobs:
-        _upsert_scored_job(scored_job, connection, timestamp)
+        _upsert_scored_job(normalize_scored_job(scored_job), connection, timestamp)
     connection.commit()
     return len(scored_jobs)
 
@@ -51,7 +53,7 @@ def fetch_all_jobs(connection: sqlite3.Connection) -> list[sqlite3.Row]:
 
     The list is workflow-first: jobs Beacon says to apply to appear before
     investigation rows, skipped rows sink to the bottom, and each group shows
-    newest discoveries first.
+    newest first-seen opportunities first.
     """
 
     return list(
@@ -66,7 +68,7 @@ def fetch_all_jobs(connection: sqlite3.Connection) -> list[sqlite3.Row]:
                     WHEN 'Skip' THEN 2
                     ELSE 3
                 END,
-                created_at DESC,
+                first_seen_at DESC,
                 score DESC
             """
         )
@@ -121,9 +123,71 @@ def update_job_status(connection: sqlite3.Connection, job_id: int, status: str) 
     return cursor.rowcount > 0
 
 
+def update_scored_job_by_id(
+    connection: sqlite3.Connection,
+    job_id: int,
+    scored_job: ScoredJob,
+) -> bool:
+    """Replace parsed/scored fields for one existing row and refresh fingerprint."""
+
+    scored_job = normalize_scored_job(scored_job)
+    job = scored_job.job
+    fingerprint = job_fingerprint(scored_job)
+    timestamp = datetime.now(UTC).isoformat()
+    cursor = connection.execute(
+        """
+        UPDATE jobs
+        SET
+            job_fingerprint = ?,
+            company = ?,
+            title = ?,
+            location = ?,
+            work_mode = ?,
+            salary_range = ?,
+            salary_estimate = ?,
+            seniority = ?,
+            required_skills_json = ?,
+            preferred_skills_json = ?,
+            job_link = ?,
+            source_email = ?,
+            posted_date = ?,
+            is_expired = ?,
+            score = ?,
+            category = ?,
+            explanation = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            fingerprint,
+            job.company,
+            job.title,
+            job.location,
+            job.work_mode,
+            job.salary_range,
+            estimate_salary(job.salary_range),
+            job.seniority,
+            json.dumps(job.required_skills),
+            json.dumps(job.preferred_skills),
+            job.job_link,
+            job.source_email,
+            job.posted_date,
+            int(job.is_expired),
+            scored_job.score,
+            scored_job.category,
+            scored_job.explanation,
+            timestamp,
+            job_id,
+        ),
+    )
+    connection.commit()
+    return cursor.rowcount > 0
+
+
 def job_fingerprint(scored_job: ScoredJob) -> str:
     """Create a stable fingerprint from the same fields used for dedupe."""
 
+    scored_job = normalize_scored_job(scored_job)
     key_text = "|".join(job_identity_key(scored_job.job))
     return hashlib.sha256(key_text.encode("utf-8")).hexdigest()
 
@@ -161,12 +225,14 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             location TEXT,
             work_mode TEXT,
             salary_range TEXT,
+            salary_estimate INTEGER,
             seniority TEXT,
             required_skills_json TEXT NOT NULL,
             preferred_skills_json TEXT NOT NULL,
             job_link TEXT,
             source_email TEXT,
             posted_date TEXT,
+            is_expired INTEGER NOT NULL DEFAULT 0,
             score INTEGER NOT NULL,
             category TEXT NOT NULL,
             explanation TEXT NOT NULL,
@@ -213,6 +279,21 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
             (timestamp,),
         )
 
+    if "is_expired" not in existing_columns:
+        connection.execute("ALTER TABLE jobs ADD COLUMN is_expired INTEGER NOT NULL DEFAULT 0")
+
+    if "salary_estimate" not in existing_columns:
+        connection.execute("ALTER TABLE jobs ADD COLUMN salary_estimate INTEGER")
+        for row in connection.execute("SELECT id, salary_range FROM jobs").fetchall():
+            connection.execute(
+                """
+                UPDATE jobs
+                SET salary_estimate = ?
+                WHERE id = ?
+                """,
+                (estimate_salary(row["salary_range"]), row["id"]),
+            )
+
     connection.commit()
 
 
@@ -223,6 +304,7 @@ def _upsert_scored_job(
 ) -> None:
     """Persist one scored job, updating sightings when the fingerprint exists."""
 
+    scored_job = normalize_scored_job(scored_job)
     job = scored_job.job
     fingerprint = job_fingerprint(scored_job)
     connection.execute(
@@ -237,12 +319,14 @@ def _upsert_scored_job(
             location,
             work_mode,
             salary_range,
+            salary_estimate,
             seniority,
             required_skills_json,
             preferred_skills_json,
             job_link,
             source_email,
             posted_date,
+            is_expired,
             score,
             category,
             explanation,
@@ -250,7 +334,7 @@ def _upsert_scored_job(
             created_at,
             updated_at
         )
-        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', ?, ?)
+        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New', ?, ?)
         ON CONFLICT(job_fingerprint) DO UPDATE SET
             last_seen_at = excluded.last_seen_at,
             seen_count = jobs.seen_count + 1,
@@ -259,12 +343,14 @@ def _upsert_scored_job(
             location = excluded.location,
             work_mode = excluded.work_mode,
             salary_range = excluded.salary_range,
+            salary_estimate = excluded.salary_estimate,
             seniority = excluded.seniority,
             required_skills_json = excluded.required_skills_json,
             preferred_skills_json = excluded.preferred_skills_json,
             job_link = excluded.job_link,
             source_email = excluded.source_email,
             posted_date = excluded.posted_date,
+            is_expired = excluded.is_expired,
             score = excluded.score,
             category = excluded.category,
             explanation = excluded.explanation,
@@ -279,12 +365,14 @@ def _upsert_scored_job(
             job.location,
             job.work_mode,
             job.salary_range,
+            estimate_salary(job.salary_range),
             job.seniority,
             json.dumps(job.required_skills),
             json.dumps(job.preferred_skills),
             job.job_link,
             job.source_email,
             job.posted_date,
+            int(job.is_expired),
             scored_job.score,
             scored_job.category,
             scored_job.explanation,

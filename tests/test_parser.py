@@ -169,6 +169,7 @@ class ParserTests(unittest.TestCase):
 
     def test_strips_expiring_job_subject_prefix(self) -> None:
         """LinkedIn expiration reminders should expose the underlying role."""
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
         email = SourceEmail(
             source_id="expiring",
             subject="Kiana, your job’s expiring on Jul 2: Senior Data Scientist - Shopping Experience (Search)",
@@ -177,10 +178,40 @@ class ParserTests(unittest.TestCase):
             body="Company: Instacart\nSkills: machine learning, experimentation.",
         )
 
-        job = parse_email(email)[0]
+        job = parse_email(email, now=now)[0]
 
         self.assertEqual(job.company, "Instacart")
         self.assertEqual(job.title, "Senior Data Scientist")
+        self.assertFalse(job.is_expired)
+
+    def test_detects_expired_job_from_closed_wording(self) -> None:
+        """Explicit closed/expired language should mark the job as expired."""
+        email = SourceEmail(
+            source_id="expired",
+            subject="Senior Applied AI Engineer",
+            sender="LinkedIn Jobs <jobs-noreply@linkedin.com>",
+            received_at=None,
+            body="This job is no longer accepting applications.\nCompany: Cohere",
+        )
+
+        job = parse_email(email)[0]
+
+        self.assertTrue(job.is_expired)
+
+    def test_detects_expired_job_from_past_expiry_date(self) -> None:
+        """`Expiring on Jul 2` should become expired after that date passes."""
+        now = datetime(2026, 7, 3, 12, 0, tzinfo=UTC)
+        email = SourceEmail(
+            source_id="past_expiry",
+            subject="Kiana, your job’s expiring on Jul 2: Senior Data Scientist",
+            sender="LinkedIn Jobs <jobs-noreply@linkedin.com>",
+            received_at=None,
+            body="Company: Instacart\nSkills: machine learning.",
+        )
+
+        job = parse_email(email, now=now)[0]
+
+        self.assertTrue(job.is_expired)
 
     def test_strips_new_jobs_similar_to_prefix(self) -> None:
         """LinkedIn digest headings should not become literal job titles."""
@@ -196,6 +227,51 @@ class ParserTests(unittest.TestCase):
 
         self.assertEqual(job.company, "Clio")
         self.assertEqual(job.title, "Staff Data Scientist")
+
+    def test_parses_linkedin_company_is_hiring_subject(self) -> None:
+        """`StackAdapt is hiring...` should expose StackAdapt as the company."""
+        email = SourceEmail(
+            source_id="stackadapt_hiring",
+            subject="StackAdapt is hiring a Senior/Staff Applied Machine Learning Scientist",
+            sender="LinkedIn Jobs <jobs-noreply@linkedin.com>",
+            received_at=None,
+            body="Skills: machine learning, LLM, recommendation systems.",
+        )
+
+        job = parse_email(email)[0]
+
+        self.assertEqual(job.company, "StackAdapt")
+        self.assertEqual(job.title, "Senior/Staff Applied Machine Learning Scientist")
+
+    def test_normalizes_company_and_title_display_names(self) -> None:
+        """Parsed jobs should use canonical company and title formatting."""
+        email = SourceEmail(
+            source_id="normalization",
+            subject="kiana, apply to senior ai engineer (remote) - ada cx: up to date",
+            sender="LinkedIn Jobs <jobs-noreply@linkedin.com>",
+            received_at=None,
+            body="Skills: LLM, RAG, evaluation.",
+        )
+
+        job = parse_email(email)[0]
+
+        self.assertEqual(job.company, "Ada CX")
+        self.assertEqual(job.title, "Senior AI Engineer")
+
+    def test_company_is_hiring_subject_wins_over_unrelated_dash_suffix(self) -> None:
+        """LinkedIn snippets may include unrelated text after a dash."""
+        email = SourceEmail(
+            source_id="stackadapt_suffix",
+            subject="StackAdapt is hiring a Applied Machine Learning Scientist (Remote) - Wealthsimple",
+            sender="LinkedIn Jobs <jobs-noreply@linkedin.com>",
+            received_at=None,
+            body="Skills: machine learning, experimentation.",
+        )
+
+        job = parse_email(email)[0]
+
+        self.assertEqual(job.company, "StackAdapt")
+        self.assertEqual(job.title, "Applied Machine Learning Scientist")
 
     def test_cleans_company_names_with_alert_suffixes(self) -> None:
         """Company strings like `Dayforce: update` should keep only the name."""
@@ -275,6 +351,26 @@ class ParserTests(unittest.TestCase):
         job = parse_email(email, now=now)[0]
 
         self.assertEqual(job.posted_date, "2 days ago")
+
+    def test_preserves_recent_posted_age_precision(self) -> None:
+        """Very recent job alerts should keep minute precision for highlighting."""
+        email_time = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
+        now = datetime(2026, 7, 2, 12, 0, tzinfo=UTC)
+        email = SourceEmail(
+            source_id="fresh_linkedin",
+            subject="Senior Applied AI Engineer at Cohere",
+            sender="LinkedIn Jobs <jobs-noreply@linkedin.com>",
+            received_at=email_time,
+            body=(
+                "Company: Cohere\n"
+                "Role: Senior Applied AI Engineer\n"
+                "Posted 37 minutes ago.\n"
+            ),
+        )
+
+        job = parse_email(email, now=now)[0]
+
+        self.assertEqual(job.posted_date, "37 minutes ago")
 
 
 if __name__ == "__main__":

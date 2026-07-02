@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import sys
 from datetime import UTC, datetime, timedelta
 
+from .compensation import format_salary_estimate
 from .dedupe import dedupe_jobs
 from .digest import render_digest
 from .email_filter import is_likely_job_email, is_obvious_non_job_row
 from .email_sources import EmailSource, GmailImapEmailSource, LocalFixtureEmailSource
+from .employment import infer_employment_type
+from .models import JobOpportunity
+from .normalization import normalize_company, normalize_title
 from .parser import parse_email
 from .scorer import score_job
 from .storage import (
@@ -15,6 +21,7 @@ from .storage import (
     fetch_all_jobs,
     fetch_job_by_id,
     initialize_storage,
+    update_scored_job_by_id,
     update_job_status,
     upsert_scored_jobs,
 )
@@ -101,19 +108,22 @@ def list_jobs() -> int:
         print("No stored jobs found. Run `python -m beacon.main run-local` first.")
         return 0
 
-    print("ID  Score  Category     Status            Seen  Posted       Added             Company        Title")
-    print("--  -----  -----------  ----------------  ----  -----------  ----------------  -------------  -----")
+    print("ID   Sc  Sal      Type      Cat    St      Seen  Exp  Posted  Added        Company        Title")
+    print("---  --  -------  --------  -----  ------  ----  ---  ------  -----------  -------------  -----")
     for row in rows:
         print(
-            f"{row['id']:<2}  "
-            f"{row['score']:<5}  "
-            f"{row['category']:<11}  "
-            f"{row['status']:<16}  "
+            f"{row['id']:<3}  "
+            f"{row['score']:<2}  "
+            f"{_format_table_salary(row['salary_estimate']):<7}  "
+            f"{_format_table_employment_type(row):<8}  "
+            f"{_format_table_category(row['category']):<5}  "
+            f"{_format_table_status(row['status']):<6}  "
             f"{row['seen_count']:<4}  "
-            f"{_truncate(row['posted_date'] or 'Unknown', 11):<11}  "
-            f"{_format_table_timestamp(row['created_at']):<16}  "
+            f"{_yes_no_short(row['is_expired']):<3}  "
+            f"{_format_posted_age(row['posted_date']):<6}  "
+            f"{_format_table_timestamp(row['first_seen_at']):<11}  "
             f"{_truncate(_console_text(row['company']), 13):<13}  "
-            f"{_console_text(row['title'])}"
+            f"{_truncate(_console_text(row['title']), 76)}"
         )
     return 0
 
@@ -137,7 +147,8 @@ def digest_jobs(
         row
         for row in rows
         if row["category"] in visible_categories
-        and _parse_stored_timestamp(row["created_at"], fallback=current_time) >= cutoff
+        and not row["is_expired"]
+        and _parse_stored_timestamp(row["first_seen_at"], fallback=current_time) >= cutoff
     ][:limit]
 
     print(_render_stored_digest(digest_rows, since_hours=since_hours, include_investigate=include_investigate))
@@ -162,7 +173,10 @@ def show_job(job_id: int) -> int:
     print(f"Status: {row['status']}")
     print(f"Location: {row['location'] or 'Unknown location'}")
     print(f"Work mode: {row['work_mode'] or 'Unknown'}")
+    print(f"Employment type: {_employment_type_from_row(row)}")
     print(f"Salary: {row['salary_range'] or 'Unknown'}")
+    print(f"Salary estimation: {format_salary_estimate(row['salary_estimate'])}")
+    print(f"Expired: {_yes_no(row['is_expired'])}")
     print(f"Posted: {row['posted_date'] or 'Unknown'}")
     print(f"Link: {row['job_link'] or 'No job URL found'}")
     print(f"Seen: {row['seen_count']} time(s)")
@@ -248,6 +262,114 @@ def cleanup_skipped_jobs(apply: bool = False) -> int:
     return 0
 
 
+def repair_hiring_rows(apply: bool = False) -> int:
+    """Preview or repair stored rows shaped like `Company is hiring a Role`."""
+
+    connection = initialize_storage()
+    rows = []
+    for row in fetch_all_jobs(connection):
+        repair = _company_is_hiring_repair(row["title"])
+        if repair:
+            rows.append((row, repair))
+
+    if not rows:
+        connection.close()
+        print("No company-is-hiring rows found.")
+        return 0
+
+    action = "Repairing" if apply else "Would repair"
+    print(f"{action} {len(rows)} company-is-hiring row(s):")
+    for row, repair in rows:
+        company, title = repair
+        print(_console_text(
+            f"- {row['id']}: "
+            f"{_console_text(row['company'])} - {_console_text(row['title'])} "
+            f"-> {company} - {title}"
+        ))
+        if apply:
+            update_scored_job_by_id(
+                connection,
+                row["id"],
+                score_job(_job_from_row_with_updates(row, company=company, title=title)),
+            )
+
+    connection.close()
+    if not apply:
+        print("Run `python -m beacon.main repair-hiring-rows --apply` to update them.")
+    return 0
+
+
+def normalize_stored_jobs(apply: bool = False) -> int:
+    """Preview or normalize company/title fields for existing stored rows."""
+
+    connection = initialize_storage()
+    rows = []
+    for row in fetch_all_jobs(connection):
+        company = normalize_company(row["company"])
+        title = normalize_title(row["title"])
+        if company != row["company"] or title != row["title"]:
+            rows.append((row, company, title))
+
+    if not rows:
+        connection.close()
+        print("No stored jobs need company/title normalization.")
+        return 0
+
+    action = "Normalizing" if apply else "Would normalize"
+    print(f"{action} {len(rows)} stored job row(s):")
+    for row, company, title in rows:
+        print(_console_text(
+            f"- {row['id']}: "
+            f"{_console_text(row['company'])} - {_console_text(row['title'])} "
+            f"-> {company} - {title}"
+        ))
+        if apply:
+            update_scored_job_by_id(
+                connection,
+                row["id"],
+                score_job(_job_from_row_with_updates(row, company=company, title=title)),
+            )
+
+    connection.close()
+    if not apply:
+        print("Run `python -m beacon.main normalize-stored-jobs --apply` to update them.")
+    return 0
+
+
+def rescore_stored_jobs(apply: bool = False) -> int:
+    """Preview or apply the latest scoring rules to every stored job."""
+
+    connection = initialize_storage()
+    rows = fetch_all_jobs(connection)
+    changes = []
+    for row in rows:
+        rescored = score_job(_job_from_row_with_updates(row, company=row["company"], title=row["title"]))
+        if _stored_score_differs(row, rescored):
+            changes.append((row, rescored))
+
+    if not changes:
+        connection.close()
+        print("No stored jobs need rescoring.")
+        return 0
+
+    action = "Rescoring" if apply else "Would rescore"
+    print(f"{action} {len(changes)} stored job row(s):")
+    for row, rescored in changes:
+        print(_console_text(
+            f"- {row['id']}: "
+            f"{row['score']} {row['category']} Exp={_yes_no_short(row['is_expired'])} "
+            f"-> {rescored.score} {rescored.category} Exp={_yes_no_short(rescored.job.is_expired)} "
+            f"{rescored.job.company} - {rescored.job.title}"
+        ))
+        if apply:
+            update_scored_job_by_id(connection, row["id"], rescored)
+
+    connection.close()
+    if not apply:
+        print("Run `python -m beacon.main rescore-stored-jobs --apply` to update them.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line interface for local Beacon commands."""
 
@@ -322,6 +444,33 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Actually delete the previewed skipped rows.",
     )
+    hiring_repair_parser = subparsers.add_parser(
+        "repair-hiring-rows",
+        help="Preview or repair stored rows like `Company is hiring a Role`.",
+    )
+    hiring_repair_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually repair the previewed rows.",
+    )
+    normalize_parser = subparsers.add_parser(
+        "normalize-stored-jobs",
+        help="Preview or normalize stored company/title display fields.",
+    )
+    normalize_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually normalize the previewed rows.",
+    )
+    rescore_parser = subparsers.add_parser(
+        "rescore-stored-jobs",
+        help="Preview or apply the latest scoring rules to stored jobs.",
+    )
+    rescore_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually rescore the previewed rows.",
+    )
     return parser
 
 
@@ -354,6 +503,12 @@ def main() -> int:
             return cleanup_non_jobs(apply=args.apply)
         if args.command == "cleanup-skipped":
             return cleanup_skipped_jobs(apply=args.apply)
+        if args.command == "repair-hiring-rows":
+            return repair_hiring_rows(apply=args.apply)
+        if args.command == "normalize-stored-jobs":
+            return normalize_stored_jobs(apply=args.apply)
+        if args.command == "rescore-stored-jobs":
+            return rescore_stored_jobs(apply=args.apply)
     except RuntimeError as error:
         print(f"Error: {error}")
         return 1
@@ -374,14 +529,85 @@ def _format_table_timestamp(value: str | None) -> str:
     """Format ISO timestamps compactly for the list-jobs table."""
 
     if not value:
-        return "Unknown"
+        return "-"
 
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
-        return _truncate(value, 16)
+        return _truncate(value, 11)
 
-    return parsed.strftime("%Y-%m-%d %H:%M")
+    return parsed.strftime("%m-%d %H:%M")
+
+
+def _format_posted_age(value: str | None) -> str:
+    """Format posted-age text into compact table values."""
+
+    if not value:
+        return "-"
+
+    text = str(value).strip().casefold().rstrip(".")
+    if text in ("unknown", "none", ""):
+        return "-"
+    if text == "today":
+        return "today"
+
+    match = re.search(r"(?P<count>\d+)\s*(?P<unit>minute|minutes|hour|hours|day|days|week|weeks|month|months)", text)
+    if not match:
+        return _truncate(str(value).strip(), 6)
+
+    count = match.group("count")
+    unit = match.group("unit")
+    if unit.startswith("minute"):
+        return f"{count}m"
+    if unit.startswith("hour"):
+        return f"{count}h"
+    if unit.startswith("day"):
+        return f"{count}d"
+    if unit.startswith("week"):
+        return f"{count}w"
+    if unit.startswith("month"):
+        return f"{count}mo"
+    return _truncate(str(value).strip(), 6)
+
+
+def _format_table_salary(value: object) -> str:
+    """Format salary estimates compactly and hide unknown values."""
+
+    formatted = format_salary_estimate(value)
+    return "-" if formatted == "Unknown" else formatted
+
+
+def _format_table_employment_type(row: object) -> str:
+    """Format employment type compactly and hide unknown values."""
+
+    employment_type = _employment_type_from_row(row)
+    if employment_type == "Unknown":
+        return "-"
+    return employment_type
+
+
+def _format_table_category(value: str) -> str:
+    """Abbreviate action categories for compact table output."""
+
+    aliases = {
+        "Apply now": "Apply",
+        "Investigate": "Inv",
+        "Skip": "Skip",
+    }
+    return aliases.get(value, _truncate(value, 5))
+
+
+def _format_table_status(value: str) -> str:
+    """Abbreviate workflow status for compact table output."""
+
+    aliases = {
+        "New": "New",
+        "Reviewed": "Review",
+        "Applied": "Appl",
+        "Skipped": "Skip",
+        "Follow-up needed": "Follow",
+    }
+    return aliases.get(value, _truncate(value, 6))
 
 
 def _parse_stored_timestamp(value: str | None, fallback: datetime) -> datetime:
@@ -405,16 +631,95 @@ def _render_stored_digest(rows: list[object], since_hours: int, include_investig
 
     categories = "Apply now and Investigate" if include_investigate else "Apply now"
     if not rows:
-        return f"No {categories} jobs added in the last {since_hours} hour(s)."
+        return f"No {categories} jobs first seen in the last {since_hours} hour(s)."
 
     lines = [f"Beacon {categories} digest - last {since_hours} hour(s)", ""]
     for rank, row in enumerate(rows, 1):
         link = row["job_link"] or "No job URL found"
         lines.append(f"{rank}. [{row['score']}] #{row['id']} {row['company']} - {row['title']}")
-        lines.append(f"   Added: {_format_table_timestamp(row['created_at'])}")
+        lines.append(f"   First seen: {_format_table_timestamp(row['first_seen_at'])}")
         lines.append(f"   Link: {link}")
         lines.append(f"   Why: {_console_text(row['explanation'])}")
     return "\n".join(_console_text(line) for line in lines)
+
+
+def _employment_type_from_row(row: object) -> str:
+    """Infer employment type from stored row fields used by the CLI."""
+
+    return infer_employment_type(
+        [
+            row["title"],
+            row["seniority"],
+            row["work_mode"],
+            row["salary_range"],
+            row["required_skills_json"],
+            row["preferred_skills_json"],
+            row["explanation"],
+        ]
+    )
+
+
+def _stored_score_differs(row: object, rescored: object) -> bool:
+    """Return whether rescoring would change a stored row."""
+
+    return (
+        row["score"] != rescored.score
+        or row["category"] != rescored.category
+        or bool(row["is_expired"]) != rescored.job.is_expired
+        or row["company"] != rescored.job.company
+        or row["title"] != rescored.job.title
+        or row["explanation"] != rescored.explanation
+    )
+
+
+def _company_is_hiring_repair(title: str) -> tuple[str, str] | None:
+    """Return corrected company/title for stored `Company is hiring...` titles."""
+
+    title_pattern = (
+        r"(?:Senior/Staff\s+|Senior\s+|Staff\s+)?(?:Applied\s+)?(?:Data Scientist|"
+        r"Machine Learning Scientist|Machine Learning Engineer|ML Scientist|"
+        r"ML Engineer|AI Engineer|Applied AI Engineer)"
+    )
+    match = re.search(
+        rf"(?P<company>[A-Z][A-Za-z0-9&.' -]+?)\s+is hiring\s+(?:a |an )?"
+        rf"(?P<title>{title_pattern})(?:\s*\([^)]*\))?",
+        title,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group("company").strip(), match.group("title").strip()
+
+
+def _job_from_row_with_updates(row: object, company: str, title: str) -> JobOpportunity:
+    """Build a JobOpportunity from a stored row while replacing parsed fields."""
+
+    return JobOpportunity(
+        company=company,
+        title=title,
+        location=row["location"],
+        work_mode=row["work_mode"],
+        salary_range=row["salary_range"],
+        seniority=row["seniority"],
+        required_skills=tuple(json.loads(row["required_skills_json"])),
+        preferred_skills=tuple(json.loads(row["preferred_skills_json"])),
+        job_link=row["job_link"],
+        source_email=row["source_email"],
+        posted_date=row["posted_date"],
+        is_expired=bool(row["is_expired"]),
+    )
+
+
+def _yes_no(value: object) -> str:
+    """Format SQLite booleans for compact CLI output."""
+
+    return "Yes" if bool(value) else "No"
+
+
+def _yes_no_short(value: object) -> str:
+    """Format booleans for dense table output."""
+
+    return "Y" if bool(value) else "N"
 
 
 def _console_text(value: object) -> str:

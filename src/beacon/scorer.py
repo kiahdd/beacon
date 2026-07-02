@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import re
 
 from .config import CareerPreferences, DEFAULT_PREFERENCES
 from .models import JobOpportunity, ScoredJob
+from .normalization import normalize_job
 
 
 # The scoring rubric is additive, then clamped into this range. Keeping the
@@ -29,15 +31,35 @@ def score_job(
     - Location signal: neutral for now while LinkedIn location extraction is incomplete
     - Target skill fit: up to 25 points
     - Relevant DS domain signal: up to 8 points
+    - Personal company whitelist: up to 15 points
     - Preferred company tier: up to 10 points
     - Strategic next-step fit: up to 12 points
     - Seniority/growth fit: up to 15 points
     - Salary signal: up to 10 points
-    - Penalties: missing/negative signals subtract points
+    - Penalties and personal blacklist: contract, relocation, and missing/negative
+      signals subtract points
+    - Expiry handling: explicit expired signals or postings 14+ days old force Skip
 
     This is deliberately simple and explainable. Once Beacon has real data, we
     can tune weights or add an LLM review only for uncertain/high-potential jobs.
     """
+
+    job = _mark_old_posting_expired(normalize_job(job))
+
+    blacklist_match = _first_company_match(
+        _job_searchable_text(job),
+        preferences.personal_company_blacklist,
+    )
+    if blacklist_match:
+        return ScoredJob(
+            job=job,
+            score=MIN_SCORE,
+            category="Skip",
+            explanation=(
+                "company is on personal blacklist: "
+                f"{_display_keyword(blacklist_match)}"
+            ),
+        )
 
     score = 0
     reasons: list[str] = []
@@ -62,6 +84,11 @@ def score_job(
     if domain_reason:
         reasons.append(domain_reason)
 
+    personal_company_points, personal_company_reason = _score_personal_company(job, preferences)
+    score += personal_company_points
+    if personal_company_reason:
+        reasons.append(personal_company_reason)
+
     company_points, company_reason = _score_company(job, preferences)
     score += company_points
     if company_reason:
@@ -80,10 +107,18 @@ def score_job(
     score += salary_points
     reasons.append(salary_reason)
 
+    fresh_posting_reason = _fresh_posting_reason(job)
+    if fresh_posting_reason:
+        reasons.append(fresh_posting_reason)
+
     penalty_points, penalty_reason = _score_penalties(job)
     score += penalty_points
     if penalty_reason:
         reasons.append(penalty_reason)
+
+    if job.is_expired:
+        score = MIN_SCORE
+        reasons.append("job appears expired or no longer accepting applications")
 
     score = _clamp_score(score)
     category = _category_for_score(score, preferences)
@@ -174,19 +209,35 @@ def _score_company(job: JobOpportunity, preferences: CareerPreferences) -> tuple
 
     searchable_text = f"{job.company} {job.title}".casefold()
 
-    tier_a_match = _first_keyword_match(searchable_text, preferences.tier_a_companies)
+    tier_a_match = _first_company_match(searchable_text, preferences.tier_a_companies)
     if tier_a_match:
         if tier_a_match in ("workday", "thomson reuters") and not _is_ai_platform_focused(job):
             return 0, f"{_display_keyword(tier_a_match)} needs AI/platform focus for tier A boost"
         return 10, f"tier A company preference: {_display_keyword(tier_a_match)}"
 
-    tier_b_match = _first_keyword_match(searchable_text, preferences.tier_b_companies)
+    tier_b_match = _first_company_match(searchable_text, preferences.tier_b_companies)
     if tier_b_match:
         return 6, f"tier B company preference: {_display_keyword(tier_b_match)}"
 
-    tier_c_match = _first_keyword_match(searchable_text, preferences.tier_c_companies)
+    tier_c_match = _first_company_match(searchable_text, preferences.tier_c_companies)
     if tier_c_match and _is_ai_platform_focused(job):
         return 3, f"traditional enterprise with AI/platform focus: {_display_keyword(tier_c_match)}"
+
+    return 0, None
+
+
+def _score_personal_company(
+    job: JobOpportunity,
+    preferences: CareerPreferences,
+) -> tuple[int, str | None]:
+    """Apply Kiana-specific company preferences before general company tiers."""
+
+    whitelist_match = _first_company_match(
+        _job_searchable_text(job),
+        preferences.personal_company_whitelist,
+    )
+    if whitelist_match:
+        return 15, f"personal company whitelist: {_display_keyword(whitelist_match)}"
 
     return 0, None
 
@@ -198,10 +249,10 @@ def _score_strategic_next_step(
     """Score whether this role advances Kiana's long-term AI direction."""
 
     searchable_text = _job_searchable_text(job)
-    ai_native_match = _first_keyword_match(searchable_text, preferences.ai_native_companies)
+    ai_native_match = _first_company_match(searchable_text, preferences.ai_native_companies)
     has_strategic_direction = _has_any_keyword(searchable_text, preferences.strategic_direction_keywords)
     has_limited_direction = _has_any_keyword(searchable_text, preferences.limited_direction_keywords)
-    tier_c_match = _first_keyword_match(searchable_text, preferences.tier_c_companies)
+    tier_c_match = _first_company_match(searchable_text, preferences.tier_c_companies)
 
     if ai_native_match and _is_target_data_science_role(job) and has_strategic_direction:
         return 14, (
@@ -334,12 +385,23 @@ def _score_penalties(job: JobOpportunity) -> tuple[int, str | None]:
 
     penalties: list[str] = []
     points = 0
+    searchable_text = _job_searchable_text(job)
 
     # Penalties are separate from the positive rubric so they are visible in the
     # explanation and easy to tune independently.
     if (job.work_mode or "").casefold() == "on-site":
         points -= 12
         penalties.append("on-site role is a preference mismatch")
+    if _has_contract_signal(searchable_text):
+        points -= 8
+        penalties.append("contract role is less preferred")
+    if _has_relocation_signal(searchable_text):
+        points -= 15
+        penalties.append("relocation requirement is a preference mismatch")
+    stale_points, stale_reason = _score_staleness(job)
+    points += stale_points
+    if stale_reason:
+        penalties.append(stale_reason)
     if "analyst" in job.title.casefold():
         points -= 10
         penalties.append("analyst title is below target scope")
@@ -351,6 +413,106 @@ def _score_penalties(job: JobOpportunity) -> tuple[int, str | None]:
         penalties.append("apply link missing")
 
     return points, ", ".join(penalties) if penalties else None
+
+
+def _score_staleness(job: JobOpportunity) -> tuple[int, str | None]:
+    """Explain old postings; 14+ day jobs are expired elsewhere."""
+
+    posted_age_days = _posted_age_days(job.posted_date)
+    if posted_age_days is None or posted_age_days < 14:
+        return 0, None
+    return 0, f"posting is more than 2 weeks old: {posted_age_days} days"
+
+
+def _mark_old_posting_expired(job: JobOpportunity) -> JobOpportunity:
+    """Treat postings 14+ days old as expired for action-list purposes."""
+
+    posted_age_days = _posted_age_days(job.posted_date)
+    if posted_age_days is None or posted_age_days < 14 or job.is_expired:
+        return job
+    return replace(job, is_expired=True)
+
+
+def _fresh_posting_reason(job: JobOpportunity) -> str | None:
+    """Highlight jobs posted within the last two hours without changing score."""
+
+    posted_age_minutes = _posted_age_minutes(job.posted_date)
+    if posted_age_minutes is None or posted_age_minutes > 120:
+        return None
+    return "fresh posting: posted within the last 2 hours"
+
+
+def _posted_age_minutes(posted_date: str | None) -> int | None:
+    """Parse minute/hour posted-age text when Beacon has recent precision."""
+
+    if not posted_date:
+        return None
+
+    text = posted_date.casefold()
+    match = re.search(r"(?P<count>\d+)\s*(?P<unit>minute|minutes|hour|hours)", text)
+    if not match:
+        return None
+
+    count = int(match.group("count"))
+    unit = match.group("unit")
+    if unit.startswith("minute"):
+        return count
+    if unit.startswith("hour"):
+        return count * 60
+    return None
+
+
+def _posted_age_days(posted_date: str | None) -> int | None:
+    """Parse Beacon's compact posted-age text into days when possible."""
+
+    if not posted_date:
+        return None
+
+    text = posted_date.casefold()
+    match = re.search(r"(?P<count>\d+)\s*(?P<unit>minute|minutes|hour|hours|day|days|week|weeks|month|months)", text)
+    if not match:
+        return None
+
+    count = int(match.group("count"))
+    unit = match.group("unit")
+    if unit.startswith("minute") or unit.startswith("hour"):
+        return 0
+    if unit.startswith("day"):
+        return count
+    if unit.startswith("week"):
+        return count * 7
+    if unit.startswith("month"):
+        return count * 30
+    return None
+
+
+def _has_contract_signal(text: str) -> bool:
+    """Return whether the role appears to be temporary contract work."""
+
+    return any(
+        re.search(pattern, text, flags=re.IGNORECASE)
+        for pattern in (
+            r"\bcontract\b",
+            r"\bcontractor\b",
+            r"\btemporary\b",
+            r"\btemp\b",
+            r"\b\d+\s*[- ]?\s*month\b",
+        )
+    )
+
+
+def _has_relocation_signal(text: str) -> bool:
+    """Return whether the role appears to require moving to another city."""
+
+    return any(
+        re.search(pattern, text, flags=re.IGNORECASE)
+        for pattern in (
+            r"\brelocat(?:e|ion|ing)\b",
+            r"\bmust relocate\b",
+            r"\bopen to relocation\b",
+            r"\brelocation required\b",
+        )
+    )
 
 
 def _category_for_score(score: int, preferences: CareerPreferences) -> str:
@@ -385,6 +547,16 @@ def _first_keyword_match(text: str, keywords: tuple[str, ...]) -> str | None:
     return None
 
 
+def _first_company_match(text: str, companies: tuple[str, ...]) -> str | None:
+    """Return the first company match without matching inside another word."""
+
+    for company in companies:
+        pattern = rf"(?<![a-z0-9]){re.escape(company)}(?![a-z0-9])"
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return company
+    return None
+
+
 def _has_any_keyword(text: str, keywords: tuple[str, ...]) -> bool:
     """Return whether normalized text contains any configured keyword."""
 
@@ -398,6 +570,7 @@ def _job_searchable_text(job: JobOpportunity) -> str:
         (
             job.company,
             job.title,
+            job.location or "",
             job.seniority or "",
             job.work_mode or "",
             " ".join(job.required_skills),
@@ -414,6 +587,8 @@ def _display_keyword(keyword: str) -> str:
         "bmo": "BMO",
         "cibc": "CIBC",
         "td": "TD",
+        "mongodb": "MongoDB",
+        "stackadapt": "StackAdapt",
     }
     return special_cases.get(keyword, keyword.title())
 

@@ -39,6 +39,7 @@ class JobOpportunity:
     job_link: str | None = None
     source_email: str | None = None
     posted_date: str | None = None
+    is_expired: bool = False
 
 
 @dataclass(frozen=True)

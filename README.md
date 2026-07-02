@@ -45,6 +45,12 @@ Company preference tiers:
 - Tier B: Dropbox, Clio, MongoDB, Dayforce, Kinaxis, Fullscript
 - Tier C: large banks, insurance companies, and traditional enterprises only when the specific role is AI/platform-focused
 
+Personal company preferences:
+
+- Whitelist: companies Beacon should pay extra attention to, even if they are not in the default tier lists.
+- Blacklist: companies Beacon should skip regardless of role fit, score, or tier.
+- If a company appears in both lists by accident, blacklist wins.
+
 ## Architecture
 
 ```text
@@ -126,10 +132,12 @@ Use a structured database for facts, metadata, statuses, and workflow state.
 - Skills
 - Apply URL
 - Posted date
+- Expired flag
 - Source
 - AI score
 - Category
 - Status
+- First-seen timestamp
 - Created timestamp
 - Updated timestamp
 
@@ -228,6 +236,7 @@ Initial scoring dimensions:
 - Salary
 - Company quality
 - AI/ML maturity
+- Personal company whitelist or blacklist
 - Databricks relevance
 - Applied AI relevance
 - MLOps relevance
@@ -238,6 +247,9 @@ Initial scoring dimensions:
 - AI agents
 - Long-term career growth
 - Work-life balance
+- Contract or relocation penalty
+- Expired flag for roles that appear 14+ days old
+- Fresh-posting highlight for jobs posted within the last 2 hours
 - Source quality and freshness
 
 Suggested score interpretation:
@@ -338,6 +350,12 @@ The digest should focus on:
 - Time-sensitive opportunities
 - Roles needing a quick investigate decision
 
+Expired jobs should be detected and hidden from action digests by default.
+Beacon should mark jobs as expired when emails say the posting is no longer
+available, no longer accepting applications, closed, or when a parsed expiry
+date is in the past. Beacon should also mark roles as expired when the parsed
+posted age is 14 days or older.
+
 Future notification options:
 
 - SMS
@@ -364,19 +382,68 @@ Scheduled jobs should periodically monitor Gmail so the system keeps running whe
 
 Beacon should evolve beyond job discovery into a complete AI career operating system.
 
-Future capabilities include:
+Future Vision (AI):
 
-- Resume optimization
-- Explainable recommendations with dimension-level scores and reason-to-apply summaries
-- Networking recommendations
-- Recruiter relationship management
+This is where Beacon becomes a Career Intelligence Agent.
+
+AI reasoning:
+
+- LLM-based resume-job matching
+- Explain why a role is a good fit
+- Cover letter generation
+- Resume tailoring
 - Interview preparation
-- Company research
-- Salary benchmarking
-- Application tracking
-- Career analytics
-- Personalized career planning
-- AI-powered career coaching
+- Skill gap recommendations
+
+Career move ranking:
+
+Instead of just ranking jobs, Beacon should rank career moves. For each
+opportunity, it should answer:
+
+- Why this role?
+- Why now?
+- What will I learn?
+- How much closer does this move get me to my 5-year goal?
+- What is the opportunity cost of taking this role?
+
+Multi-agent workflow:
+
+- Job Discovery Agent
+- Company Research Agent
+- Resume Agent
+- Networking Agent
+- Interview Coach
+- Application Tracker
+
+Company intelligence:
+
+- AI maturity score
+- Engineering culture analysis
+- Growth opportunity prediction
+- Compensation estimation
+- Layoff risk estimation
+- Work-life balance estimation
+
+Networking:
+
+- Suggest employees to contact
+- Generate personalized outreach messages
+- Detect alumni/common connections
+- Recommend conference follow-ups
+
+Decision support:
+
+- Should I apply?
+- Should I wait?
+- Should I ask for a referral?
+- Is this a better move than my current job?
+- Which of today's jobs deserves my next 30 minutes?
+
+Learning:
+
+- Recommend courses based on recurring skill gaps
+- Recommend portfolio projects aligned with target roles
+- Track readiness for AI Engineer and Senior DS roles over time
 
 ## Step-by-Step Build Plan
 
@@ -410,78 +477,6 @@ The first useful version should:
 
 After that works, the next milestone is connecting Gmail ingestion.
 
-## Local CLI Commands
+## CLI Playbook
 
-Run Beacon against Gmail IMAP using local `.env` credentials:
-
-```powershell
-$env:PYTHONPATH='src'
-python -m beacon.main run-gmail
-```
-
-The local POC uses Gmail IMAP with an app password. By default it searches the
-configured mailbox with `GMAIL_IMAP_SEARCH=ALL`, takes the newest
-`GMAIL_IMAP_MAX_RESULTS=25` message IDs, filters likely job emails, and then
-parses only those candidates. This is count-based rather than date-based. To
-look at a different window, update `.env`, for example:
-
-```env
-GMAIL_IMAP_SEARCH=ALL
-GMAIL_IMAP_MAX_RESULTS=100
-```
-
-List stored jobs:
-
-```powershell
-python -m beacon.main list-jobs
-```
-
-Show recent high-priority jobs only:
-
-```powershell
-python -m beacon.main digest
-```
-
-By default, `digest` shows `Apply now` jobs added in the last 24 hours. You can
-change the time window, limit the number of rows, or include `Investigate` jobs:
-
-```powershell
-python -m beacon.main digest --since-hours 12 --limit 5
-python -m beacon.main digest --include-investigate
-```
-
-Show one stored job:
-
-```powershell
-python -m beacon.main show-job <job_id>
-```
-
-Update a job status:
-
-```powershell
-python -m beacon.main update-status <job_id> reviewed
-```
-
-Preview obvious non-job inbox noise that slipped into SQLite:
-
-```powershell
-python -m beacon.main cleanup-non-jobs
-```
-
-Delete the previewed non-job rows:
-
-```powershell
-python -m beacon.main cleanup-non-jobs --apply
-```
-
-Preview all rows categorized as `Skip`:
-
-```powershell
-python -m beacon.main cleanup-skipped
-```
-
-Delete all rows categorized as `Skip`:
-
-```powershell
-python -m beacon.main cleanup-skipped --apply
-```
+Beacon's local command workflow lives in [CLI_PLAYBOOK.md](CLI_PLAYBOOK.md).
