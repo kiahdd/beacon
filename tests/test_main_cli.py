@@ -17,12 +17,16 @@ from beacon.main import (
     normalize_stored_jobs,
     poll_telegram,
     repair_hiring_rows,
+    review_descriptions,
+    resolve_canonical_urls,
     rescore_stored_jobs,
     run_cycle,
     send_telegram_digest,
     set_job_status,
     show_job,
+    test_search_provider,
 )
+from beacon.canonical_job_resolver import SearchProviderCheck
 from beacon.models import JobOpportunity, ScoredJob
 from beacon.storage import initialize_storage, upsert_scored_jobs
 
@@ -487,6 +491,47 @@ class MainCliTests(unittest.TestCase):
         self.assertIn(f"Updated job {job_id}", output)
         self.assertEqual(row["status"], "Reviewed")
 
+    def test_review_descriptions_prints_compact_description_preview(self) -> None:
+        """`review-descriptions` should print fetched description previews."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "beacon.db"
+            job_id = _seed_job(
+                db_path,
+                company="Cohere",
+                title="Senior Applied AI Engineer",
+                description="Build LLM evaluation systems.\nPartner with product teams.",
+            )
+            connection = initialize_storage(db_path)
+            connection.execute(
+                """
+                UPDATE jobs
+                SET job_description_url = ?,
+                    description_source = ?
+                WHERE id = ?
+                """,
+                ("https://cohere.ai/careers/123456", "source_url", job_id),
+            )
+            connection.commit()
+            connection.close()
+
+            output = _capture_with_db(db_path, review_descriptions, 5, False, 45)
+
+        self.assertIn("Reviewing 1 fetched job description", output)
+        self.assertIn(f"1. {job_id}: Cohere - Senior Applied AI Engineer", output)
+        self.assertIn("Source: source_url", output)
+        self.assertIn("URL: https://cohere.ai/careers/123456", output)
+        self.assertIn("Build LLM evaluation systems. Partner with", output)
+
+    def test_review_descriptions_handles_empty_database(self) -> None:
+        """`review-descriptions` should explain when there is nothing to review."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "beacon.db"
+            _seed_job(db_path)
+
+            output = _capture_with_db(db_path, review_descriptions)
+
+        self.assertIn("No fetched job descriptions found.", output)
+
     def test_fetch_job_descriptions_stores_description_for_new_apply_jobs(self) -> None:
         """Description fetch should enrich only eligible stored jobs."""
         from beacon.job_description_fetcher import JobDescriptionFetchResult
@@ -607,6 +652,130 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(row["description_status"], "linkedin_blocked")
         self.assertEqual(row["description_source"], "linkedin_alert_only")
         self.assertIn("LinkedIn alert URL", row["job_description_error"])
+
+    def test_resolve_canonical_urls_stores_resolved_url_for_linkedin_rows(self) -> None:
+        """Canonical resolver should fill canonical_url for LinkedIn alert rows."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "beacon.db"
+            job_id = _seed_job(
+                db_path,
+                company="Instacart",
+                title="Senior Data Scientist - Shopping Experience",
+                job_link="https://www.linkedin.com/jobs/view/123",
+            )
+
+            with patch(
+                "beacon.main.resolve_canonical_job_url",
+                return_value="https://instacart.careers/job/senior-data-scientist",
+            ) as resolver:
+                output = _capture_with_db(db_path, resolve_canonical_urls, 10, False, False)
+
+            connection = initialize_storage(db_path)
+            row = connection.execute("SELECT canonical_url FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            connection.close()
+
+        resolver.assert_called_once_with(
+            company="Instacart",
+            title="Senior Data Scientist - Shopping Experience",
+            location="Remote Canada",
+        )
+        self.assertIn("Stored 1 canonical URL", output)
+        self.assertEqual(row["canonical_url"], "https://instacart.careers/job/senior-data-scientist")
+
+    def test_resolve_canonical_urls_skips_non_linkedin_source_urls(self) -> None:
+        """Direct company URLs should not be sent through canonical search."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "beacon.db"
+            _seed_job(
+                db_path,
+                company="Cohere",
+                title="Senior Applied AI Engineer",
+                job_link="https://cohere.ai/careers/123456",
+            )
+
+            with patch("beacon.main.resolve_canonical_job_url") as resolver:
+                output = _capture_with_db(db_path, resolve_canonical_urls, 10, False, False)
+
+        resolver.assert_not_called()
+        self.assertIn("No canonical URLs need resolving.", output)
+
+    def test_resolve_canonical_urls_respects_existing_canonical_url_unless_forced(self) -> None:
+        """Existing canonical URLs should be preserved unless --force is used."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "beacon.db"
+            job_id = _seed_job(
+                db_path,
+                company="Instacart",
+                title="Senior Data Scientist",
+                job_link="https://www.linkedin.com/jobs/view/123",
+                canonical_url="https://instacart.careers/old",
+            )
+
+            with patch("beacon.main.resolve_canonical_job_url") as resolver:
+                _capture_with_db(db_path, resolve_canonical_urls, 10, False, False)
+            resolver.assert_not_called()
+
+            with patch(
+                "beacon.main.resolve_canonical_job_url",
+                return_value="https://instacart.careers/new",
+            ):
+                _capture_with_db(db_path, resolve_canonical_urls, 10, False, True)
+
+            connection = initialize_storage(db_path)
+            row = connection.execute("SELECT canonical_url FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            connection.close()
+
+        self.assertEqual(row["canonical_url"], "https://instacart.careers/new")
+
+    def test_resolve_canonical_urls_can_include_investigate_jobs(self) -> None:
+        """Investigate jobs are only resolved when explicitly included."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "beacon.db"
+            job_id = _seed_job(
+                db_path,
+                company="MaybeCo",
+                title="Data Scientist",
+                category="Investigate",
+                job_link="https://www.linkedin.com/jobs/view/456",
+            )
+
+            with patch("beacon.main.resolve_canonical_job_url") as resolver:
+                _capture_with_db(db_path, resolve_canonical_urls, 10, False, False)
+            resolver.assert_not_called()
+
+            with patch(
+                "beacon.main.resolve_canonical_job_url",
+                return_value="https://maybe.co/careers/data-scientist",
+            ) as resolver:
+                _capture_with_db(db_path, resolve_canonical_urls, 10, True, False)
+
+            connection = initialize_storage(db_path)
+            row = connection.execute("SELECT canonical_url FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            connection.close()
+
+        resolver.assert_called_once()
+        self.assertEqual(row["canonical_url"], "https://maybe.co/careers/data-scientist")
+
+    def test_test_search_provider_prints_configured_provider_health(self) -> None:
+        with patch(
+            "beacon.main.check_search_providers",
+            return_value=[
+                SearchProviderCheck(provider="serper", ok=True, result_count=3),
+                SearchProviderCheck(provider="google", ok=False, error="HTTP 403: disabled"),
+            ],
+        ) as checker:
+            output = _capture_stdout(test_search_provider, "query")
+
+        checker.assert_called_once_with("query")
+        self.assertIn("Testing search providers with query: query", output)
+        self.assertIn("- serper: ok (3 result(s))", output)
+        self.assertIn("- google: failed (HTTP 403: disabled)", output)
+
+    def test_test_search_provider_returns_error_when_none_configured(self) -> None:
+        with patch("beacon.main.check_search_providers", return_value=[]):
+            output = _capture_stdout(test_search_provider)
+
+        self.assertIn("No search providers configured.", output)
 
     def test_cleanup_non_jobs_previews_obvious_noise(self) -> None:
         """Cleanup should preview obvious inbox noise without deleting by default."""
@@ -803,6 +972,13 @@ def _capture_with_db(db_path: Path, function, *args) -> str:
     with patch("beacon.main.initialize_storage", lambda: initialize_storage(db_path)):
         with redirect_stdout(output):
             function(*args)
+    return output.getvalue()
+
+
+def _capture_stdout(function, *args) -> str:
+    output = io.StringIO()
+    with redirect_stdout(output):
+        function(*args)
     return output.getvalue()
 
 

@@ -151,6 +151,21 @@ salary/employment-type logic. This is the command that updates old rows such as
 Before calling Claude, enrich promising stored jobs with the full public posting
 text when Beacon has a job URL:
 
+Check that the configured web-search provider works:
+
+```powershell
+python -m beacon.main test-search-provider --query Flinks Senior Data Scientist careers
+```
+
+```powershell
+python -m beacon.main resolve-canonical-urls
+```
+
+This searches for company/ATS posting URLs for LinkedIn alert rows and stores
+them in `canonical_url`. Beacon skips direct LinkedIn scraping and fetches
+`canonical_url` first when it is available. The resolver searches ATS-specific
+surfaces like Greenhouse, Lever, Ashby, and Workday before broader web queries.
+
 ```powershell
 python -m beacon.main fetch-job-descriptions
 ```
@@ -158,9 +173,19 @@ python -m beacon.main fetch-job-descriptions
 By default this fetches up to 5 jobs that are `Apply now`, `New`, not expired,
 and have not already had a description stored.
 
+Review fetched descriptions before using them for application-writing context:
+
+```powershell
+python -m beacon.main review-descriptions
+python -m beacon.main review-descriptions --limit 5 --chars 1000
+```
+
 Tune the fetch:
 
 ```powershell
+python -m beacon.main resolve-canonical-urls --limit 10
+python -m beacon.main resolve-canonical-urls --include-investigate
+python -m beacon.main resolve-canonical-urls --force
 python -m beacon.main fetch-job-descriptions --limit 10
 python -m beacon.main fetch-job-descriptions --include-investigate
 python -m beacon.main fetch-job-descriptions --force
@@ -168,8 +193,9 @@ python -m beacon.main fetch-job-descriptions --timeout 30
 ```
 
 Some sites, especially LinkedIn, may show login/preview pages instead of the
-full job description. Beacon stores either the extracted text or the fetch error
-so the later Claude step can decide whether it has enough context.
+full job description. Beacon intentionally does not scrape authenticated
+LinkedIn pages; it uses the LinkedIn alert as a signal and tries to find the
+public company/ATS posting instead.
 
 ## Repair Stored Data
 

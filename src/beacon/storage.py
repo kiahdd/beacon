@@ -164,6 +164,26 @@ def update_job_description(
     return cursor.rowcount > 0
 
 
+def update_job_canonical_url(
+    connection: sqlite3.Connection,
+    job_id: int,
+    canonical_url: str,
+) -> bool:
+    """Store the resolved canonical company/ATS URL for one job."""
+
+    timestamp = datetime.now(UTC).isoformat()
+    cursor = connection.execute(
+        """
+        UPDATE jobs
+        SET canonical_url = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (canonical_url, timestamp, job_id),
+    )
+    connection.commit()
+    return cursor.rowcount > 0
+
+
 def update_scored_job_by_id(
     connection: sqlite3.Connection,
     job_id: int,

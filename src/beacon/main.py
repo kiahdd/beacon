@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .compensation import format_salary_estimate
-from .canonical_job_resolver import resolve_source_job_url
+from .canonical_job_resolver import check_search_providers, resolve_canonical_job_url, resolve_source_job_url
 from .dedupe import dedupe_jobs
 from .digest import render_digest
 from .email_filter import is_likely_job_email, is_obvious_non_job_row
@@ -25,6 +25,7 @@ from .storage import (
     fetch_job_by_id,
     initialize_storage,
     update_scored_job_by_id,
+    update_job_canonical_url,
     update_job_description,
     update_job_status,
     upsert_scored_jobs,
@@ -336,6 +337,38 @@ def show_job(job_id: int) -> int:
     return 0
 
 
+def review_descriptions(limit: int = 10, show_text: bool = False, chars: int = 600) -> int:
+    """Print a compact review of fetched job descriptions."""
+
+    connection = initialize_storage()
+    rows = [
+        row
+        for row in fetch_all_jobs(connection)
+        if row["job_description"] and str(row["job_description"]).strip()
+    ][:limit]
+    connection.close()
+
+    if not rows:
+        print("No fetched job descriptions found.")
+        return 0
+
+    print(f"Reviewing {len(rows)} fetched job description(s).")
+    for index, row in enumerate(rows, start=1):
+        description = _console_text(row["job_description"])
+        preview = _description_preview(description, chars)
+        print()
+        print(f"{index}. {row['id']}: {row['company']} - {row['title']}")
+        print(f"   Source: {row['description_source'] or 'Unknown'}")
+        print(f"   URL: {row['job_description_url'] or row['canonical_url'] or row['source_url'] or row['job_link'] or 'Unknown'}")
+        print(f"   Length: {len(description)} chars")
+        print("   Text:")
+        if show_text:
+            print(preview)
+        else:
+            print(f"   {_indent_wrapped_preview(preview)}")
+    return 0
+
+
 def set_job_status(job_id: int, status: str) -> int:
     """Update the workflow status for one stored job."""
 
@@ -415,6 +448,68 @@ def fetch_job_descriptions(
     connection.close()
     print(f"Stored {success_count} fetched description(s).")
     return 0
+
+
+def resolve_canonical_urls(
+    limit: int = 10,
+    include_investigate: bool = False,
+    force: bool = False,
+) -> int:
+    """Resolve LinkedIn alert jobs to canonical company/ATS posting URLs."""
+
+    connection = initialize_storage()
+    rows = [
+        row
+        for row in fetch_all_jobs(connection)
+        if _should_resolve_canonical_url(row, include_investigate=include_investigate, force=force)
+    ][:limit]
+
+    if not rows:
+        connection.close()
+        print("No canonical URLs need resolving.")
+        return 0
+
+    print(f"Resolving canonical URLs for {len(rows)} job(s).")
+    resolved_count = 0
+    for row in rows:
+        canonical_url = resolve_canonical_job_url(
+            company=row["company"],
+            title=row["title"],
+            location=row["location"],
+        )
+        if not canonical_url:
+            print(f"- {row['id']}: no canonical URL found for {row['company']} - {row['title']}")
+            continue
+
+        update_job_canonical_url(connection, row["id"], canonical_url)
+        resolved_count += 1
+        print(f"- {row['id']}: {canonical_url}")
+
+    connection.close()
+    print(f"Stored {resolved_count} canonical URL(s).")
+    return 0
+
+
+def test_search_provider(query: str = '"Cohere" "Applied AI Engineer" careers') -> int:
+    """Run a small live query against configured canonical-search providers."""
+
+    checks = check_search_providers(query)
+    if not checks:
+        print(
+            "No search providers configured. Set SERPER_API_KEY, SERPAPI_API_KEY, "
+            "BRAVE_SEARCH_API_KEY, or both GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID."
+        )
+        return 1
+
+    print(f"Testing search providers with query: {query}")
+    any_ok = False
+    for check in checks:
+        if check.ok:
+            any_ok = True
+            print(f"- {check.provider}: ok ({check.result_count} result(s))")
+        else:
+            print(f"- {check.provider}: failed ({check.error})")
+    return 0 if any_ok else 1
 
 
 def poll_telegram(limit: int = 20, timeout: int = 0) -> int:
@@ -792,6 +887,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show details for one stored job.",
     )
     show_parser.add_argument("job_id", type=int)
+    review_descriptions_parser = subparsers.add_parser(
+        "review-descriptions",
+        help="Review fetched job descriptions without dumping every full posting.",
+    )
+    review_descriptions_parser.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Maximum number of fetched descriptions to review.",
+    )
+    review_descriptions_parser.add_argument(
+        "--show-text",
+        action="store_true",
+        help="Print the preview text without compact indentation.",
+    )
+    review_descriptions_parser.add_argument(
+        "--chars",
+        type=int,
+        default=600,
+        help="Maximum description characters to preview per job.",
+    )
     status_parser = subparsers.add_parser(
         "update-status",
         help="Update a stored job status.",
@@ -823,6 +939,36 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=20,
         help="HTTP timeout per job page in seconds.",
+    )
+    resolve_canonical_parser = subparsers.add_parser(
+        "resolve-canonical-urls",
+        help="Resolve LinkedIn alert jobs to canonical company/ATS URLs.",
+    )
+    resolve_canonical_parser.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Maximum number of jobs to resolve.",
+    )
+    resolve_canonical_parser.add_argument(
+        "--include-investigate",
+        action="store_true",
+        help="Resolve Investigate jobs in addition to Apply now jobs.",
+    )
+    resolve_canonical_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Resolve again even if a canonical URL is already stored.",
+    )
+    test_search_provider_parser = subparsers.add_parser(
+        "test-search-provider",
+        help="Check configured canonical-search provider connectivity.",
+    )
+    test_search_provider_parser.add_argument(
+        "--query",
+        nargs="+",
+        default=['"Cohere" "Applied AI Engineer" careers'],
+        help="Search query to send to configured provider(s).",
     )
     cleanup_parser = subparsers.add_parser(
         "cleanup-non-jobs",
@@ -919,6 +1065,12 @@ def main() -> int:
             return poll_telegram(limit=args.limit, timeout=args.timeout)
         if args.command == "show-job":
             return show_job(args.job_id)
+        if args.command == "review-descriptions":
+            return review_descriptions(
+                limit=args.limit,
+                show_text=args.show_text,
+                chars=args.chars,
+            )
         if args.command == "update-status":
             return set_job_status(args.job_id, args.status)
         if args.command == "fetch-job-descriptions":
@@ -928,6 +1080,14 @@ def main() -> int:
                 force=args.force,
                 timeout=args.timeout,
             )
+        if args.command == "resolve-canonical-urls":
+            return resolve_canonical_urls(
+                limit=args.limit,
+                include_investigate=args.include_investigate,
+                force=args.force,
+            )
+        if args.command == "test-search-provider":
+            return test_search_provider(query=" ".join(args.query))
         if args.command == "cleanup-non-jobs":
             return cleanup_non_jobs(apply=args.apply)
         if args.command == "cleanup-skipped":
@@ -952,6 +1112,21 @@ def _truncate(value: str, max_length: int) -> str:
     if len(value) <= max_length:
         return value
     return value[: max_length - 1] + "."
+
+
+def _description_preview(value: str, max_chars: int) -> str:
+    """Return a readable single-preview chunk from a stored description."""
+
+    compacted = re.sub(r"\s+", " ", value).strip()
+    if max_chars <= 0:
+        return ""
+    return _truncate(compacted, max_chars)
+
+
+def _indent_wrapped_preview(value: str) -> str:
+    """Indent preview continuation lines for compact CLI output."""
+
+    return value.replace("\n", "\n   ")
 
 
 def _format_table_timestamp(value: str | None) -> str:
@@ -1111,6 +1286,27 @@ def _should_fetch_job_description(row: object, include_investigate: bool, force:
     if not force and row["job_description"]:
         return False
     return True
+
+
+def _should_resolve_canonical_url(row: object, include_investigate: bool, force: bool) -> bool:
+    """Return whether a stored row should be searched for a canonical URL."""
+
+    visible_categories = ("Apply now", "Investigate") if include_investigate else ("Apply now",)
+    if row["category"] not in visible_categories:
+        return False
+    if row["status"] != "New":
+        return False
+    if row["is_expired"]:
+        return False
+    if row["canonical_url"] and not force:
+        return False
+
+    source_url = row["source_url"] or row["job_link"]
+    if not source_url:
+        return False
+
+    resolution = resolve_source_job_url(source_url)
+    return not resolution.should_fetch_description
 
 
 def _description_fetch_target(row: object) -> tuple[str | None, str]:
