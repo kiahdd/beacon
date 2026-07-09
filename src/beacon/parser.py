@@ -62,6 +62,10 @@ def parse_email(email: SourceEmail, now: datetime | None = None) -> list[JobOppo
     The local POC assumes one job per fixture. Gmail integration can later pass
     one email at a time through this same boundary.
     """
+    linkedin_digest_jobs = _extract_linkedin_digest_jobs(email, now)
+    if linkedin_digest_jobs is not None:
+        return linkedin_digest_jobs
+
     # Title and company are pulled first because several fallback rules use the
     # subject line, sender, and email signature differently depending on what is
     # already known.
@@ -91,6 +95,68 @@ def parse_email(email: SourceEmail, now: datetime | None = None) -> list[JobOppo
         is_expired=_is_expired(email, now),
     )
     return [job]
+
+
+def _extract_linkedin_digest_jobs(email: SourceEmail, now: datetime | None = None) -> list[JobOpportunity] | None:
+    """Extract individual cards from LinkedIn multi-job digest emails."""
+
+    if "linkedin" not in f"{email.sender} {email.subject}".casefold():
+        return None
+
+    job_urls = _linkedin_job_urls(email.body)
+    if not job_urls:
+        return None
+    if len(job_urls) < 2 and not re.search(r"\bposted\s+on\s+\d{1,2}/\d{1,2}/\d{2,4}\b", email.body, re.I):
+        return None
+
+    lines = [line.strip() for line in email.body.splitlines() if line.strip()]
+    jobs: list[JobOpportunity] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    previous_url_index = -1
+
+    for index, line in enumerate(lines):
+        url = _linkedin_job_url_from_line(line)
+        if not url:
+            continue
+
+        start = max(previous_url_index + 1, index - 8)
+        end = min(len(lines), index + 5)
+        card_lines = [_clean_linkedin_digest_line(card_line) for card_line in lines[start:end]]
+        card_lines = [card_line for card_line in card_lines if card_line and not _is_linkedin_digest_noise(card_line)]
+        previous_url_index = index
+
+        title, title_index = _linkedin_digest_title(card_lines)
+        if not title:
+            continue
+
+        company = _linkedin_digest_company(card_lines, title_index)
+        if not company:
+            continue
+
+        card_text = "\n".join(card_lines)
+        key = (company.casefold(), title.casefold(), url)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+
+        jobs.append(
+            JobOpportunity(
+                company=company,
+                title=title,
+                location=_linkedin_digest_location(card_lines),
+                work_mode=_extract_work_mode(card_text),
+                salary_range=None,
+                seniority=_extract_seniority(title, card_text),
+                required_skills=_extract_required_skills(card_text),
+                preferred_skills=(),
+                job_link=url,
+                source_email=email.sender,
+                posted_date=_linkedin_digest_posted_date(card_text) or _posted_age_from_email_date(email.received_at, now),
+                is_expired=_is_expired(email, now),
+            )
+        )
+
+    return jobs
 
 
 def _extract_title(email: SourceEmail) -> str | None:
@@ -301,6 +367,171 @@ def _extract_first_url(text: str) -> str | None:
     if not match:
         return None
     return match.group(0).rstrip(").,")
+
+
+def _linkedin_job_urls(text: str) -> tuple[str, ...]:
+    """Return individual LinkedIn job-view URLs from digest text."""
+
+    return tuple(
+        match.group(0).rstrip(").,")
+        for match in re.finditer(r"https?://\S*linkedin\.com/\S*jobs/view/\S*", text, flags=re.IGNORECASE)
+    )
+
+
+def _linkedin_job_url_from_line(line: str) -> str | None:
+    """Return a LinkedIn job-view URL from one line."""
+
+    match = re.search(r"https?://\S*linkedin\.com/\S*jobs/view/\S*", line, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(0).rstrip(").,")
+
+
+def _clean_linkedin_digest_line(line: str) -> str:
+    """Normalize one LinkedIn digest card line."""
+
+    cleaned = re.sub(r"https?://\S+", "", line)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip(" -*|")
+
+
+def _is_linkedin_digest_noise(line: str) -> bool:
+    """Return whether a line is card chrome, not job identity data."""
+
+    lowered = line.casefold()
+    noise_exact = {
+        "linkedin",
+        "view job",
+        "apply",
+        "save",
+        "promoted",
+        "recommended",
+        "see more jobs",
+        "show all jobs",
+        "job alert",
+    }
+    if lowered in noise_exact:
+        return True
+    return any(
+        marker in lowered
+        for marker in (
+            "be one of the first",
+            "applicants",
+            "jobs similar to",
+            "you may be interested",
+            "unsubscribe",
+            "manage alerts",
+            "privacy policy",
+            "user agreement",
+        )
+    )
+
+
+def _linkedin_digest_title(lines: list[str]) -> tuple[str | None, int | None]:
+    """Return the most likely role title from digest card lines."""
+
+    for index, line in enumerate(lines):
+        if _looks_like_linkedin_digest_title(line):
+            return _clean_title(_strip_linkedin_posted_suffix(line)), index
+    return None, None
+
+
+def _linkedin_digest_company(lines: list[str], title_index: int | None) -> str | None:
+    """Return the likely company adjacent to a digest-card title."""
+
+    if title_index is None:
+        return None
+
+    following = lines[title_index + 1 : title_index + 5]
+    preceding = list(reversed(lines[max(0, title_index - 3) : title_index]))
+    for line in following + preceding:
+        if _looks_like_linkedin_digest_company(line):
+            return _clean_company(line)
+    return None
+
+
+def _linkedin_digest_location(lines: list[str]) -> str | None:
+    """Return a likely location line from a LinkedIn digest card."""
+
+    for line in lines:
+        if _looks_like_location_line(line) and not _looks_like_linkedin_digest_title(line):
+            return line
+    return None
+
+
+def _linkedin_digest_posted_date(text: str) -> str | None:
+    """Return an absolute LinkedIn digest posted date if present."""
+
+    match = re.search(r"\bposted\s+on\s+(?P<date>\d{1,2}/\d{1,2}/\d{2,4})\b", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return f"posted on {match.group('date')}"
+
+
+def _strip_linkedin_posted_suffix(line: str) -> str:
+    """Remove LinkedIn card metadata appended to a role title."""
+
+    cleaned = re.sub(r"\s+posted\s+on\s+\d{1,2}/\d{1,2}/\d{2,4}\b.*$", "", line, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+\d+\s+applicants?.*$", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def _looks_like_linkedin_digest_title(line: str) -> bool:
+    """Return whether a line looks like a job title in a digest card."""
+
+    cleaned = _strip_linkedin_posted_suffix(line)
+    lowered = cleaned.casefold()
+    if not cleaned:
+        return False
+    if _is_linkedin_digest_noise(cleaned):
+        return False
+    role_markers = (
+        "data scientist",
+        "machine learning",
+        "ml engineer",
+        "mlops",
+        "ml ops",
+        "ai engineer",
+        "applied ai",
+        "platform engineer",
+        "scientist",
+        "engineer",
+        "architect",
+    )
+    has_role_marker = any(marker in lowered for marker in role_markers)
+    if has_role_marker:
+        return True
+    if _looks_like_location_line(cleaned):
+        return False
+    return False
+
+
+def _looks_like_linkedin_digest_company(line: str) -> bool:
+    """Return whether a digest line is plausible company text."""
+
+    if not line or _is_linkedin_digest_noise(line):
+        return False
+    if re.search(r"\bposted\s+on\s+\d{1,2}/\d{1,2}/\d{2,4}\b", line, flags=re.IGNORECASE):
+        return False
+    if _looks_like_location_line(line):
+        return False
+    if _looks_like_linkedin_digest_title(line):
+        return False
+    if len(line.split()) > 5:
+        return False
+    return True
+
+
+def _looks_like_location_line(line: str) -> bool:
+    """Return whether a line looks like location/work-mode metadata."""
+
+    lowered = line.casefold()
+    region_codes = "ON|BC|QC|AB|NY|CA|WA|MA|TX|IL"
+    return bool(
+        re.search(r"\b(remote|hybrid|on-site|onsite|canada|united states|toronto|vancouver|montreal|ontario)\b", lowered)
+        or re.search(rf"(?:,\s*|\b)({region_codes})\b", line)
+        or re.search(rf"\b[A-Z][a-z]+,\s+(?:{region_codes})\b", line)
+    )
 
 
 def _extract_posted_date(text: str) -> str | None:

@@ -243,6 +243,80 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(job.company, "StackAdapt")
         self.assertEqual(job.title, "Senior/Staff Applied Machine Learning Scientist")
 
+    def test_parses_linkedin_digest_cards_instead_of_broad_subject(self) -> None:
+        """LinkedIn digest card titles should not be misread as companies."""
+        email = SourceEmail(
+            source_id="linkedin_digest",
+            subject="Applied AI Engineer jobs for you",
+            sender="LinkedIn Jobs <jobs-noreply@linkedin.com>",
+            received_at=None,
+            body=(
+                "Recommended jobs\n\n"
+                "AI / ML Ops Lead / Architect posted on 7/6/26\n"
+                "Acme AI\n"
+                "Toronto, ON (Remote)\n"
+                "View job\n"
+                "https://www.linkedin.com/comm/jobs/view/4433244312/?trackingId=abc\n\n"
+                "Principal Platform Engineer, ML posted on 7/5/26\n"
+                "Doppel\n"
+                "Canada Remote\n"
+                "https://www.linkedin.com/comm/jobs/view/4436983390/?trackingId=def\n"
+            ),
+        )
+
+        jobs = parse_email(email)
+
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual(jobs[0].company, "Acme AI")
+        self.assertEqual(jobs[0].title, "AI / ML Ops Lead / Architect")
+        self.assertEqual(jobs[0].location, "Toronto, ON (Remote)")
+        self.assertEqual(jobs[0].work_mode, "Remote")
+        self.assertEqual(jobs[0].posted_date, "posted on 7/6/26")
+        self.assertEqual(jobs[0].job_link, "https://www.linkedin.com/comm/jobs/view/4433244312/?trackingId=abc")
+        self.assertEqual(jobs[1].company, "Doppel")
+        self.assertEqual(jobs[1].title, "Principal Platform Engineer, ML")
+
+    def test_linkedin_digest_skips_cards_without_company(self) -> None:
+        """Digest cards with no company should not invent one from posted metadata."""
+        email = SourceEmail(
+            source_id="linkedin_digest_missing_company",
+            subject="Applied AI Engineer jobs for you",
+            sender="LinkedIn Jobs <jobs-noreply@linkedin.com>",
+            received_at=None,
+            body=(
+                "Senior MLOps Engineer posted on 7/4/26\n"
+                "Remote\n"
+                "https://www.linkedin.com/comm/jobs/view/4400299927/?trackingId=abc\n"
+            ),
+        )
+
+        jobs = parse_email(email)
+
+        self.assertEqual(jobs, [])
+
+    def test_linkedin_digest_does_not_treat_role_line_as_location(self) -> None:
+        """Role lines with remote text should not become the location field."""
+        email = SourceEmail(
+            source_id="linkedin_digest_role_location",
+            subject="Data Scientist jobs for you",
+            sender="LinkedIn Jobs <jobs-noreply@linkedin.com>",
+            received_at=None,
+            body=(
+                "Data Scientist posted on 7/7/26\n"
+                "Wealthsimple\n"
+                "Senior Machine Learning Engineer (Remote, Canada)\n"
+                "Canada\n"
+                "https://www.linkedin.com/comm/jobs/view/4436764107/?trackingId=abc\n"
+            ),
+        )
+
+        jobs = parse_email(email)
+
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].company, "Wealthsimple")
+        self.assertEqual(jobs[0].title, "Data Scientist")
+        self.assertEqual(jobs[0].location, "Canada")
+
     def test_normalizes_company_and_title_display_names(self) -> None:
         """Parsed jobs should use canonical company and title formatting."""
         email = SourceEmail(
